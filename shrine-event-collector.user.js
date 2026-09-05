@@ -1,1243 +1,887 @@
 // ==UserScript==
 // @name         神社记录采集器
 // @namespace    shrine-event-study
-// @version      1.1.0
+// @version      2.0.0
 // @updateURL    https://raw.githubusercontent.com/ZEPHYR65537/shrine-event-collector/main/shrine-event-collector.user.js
 // @downloadURL  https://raw.githubusercontent.com/ZEPHYR65537/shrine-event-collector/main/shrine-event-collector.user.js
-// @description  只读扫描神社积分日志，分享已签名的新版事件增量与生涯汇总。
+// @description  扫描全部神社事件，保存断点，显示总收入并分享签名增量包。
 // @match        https://bbs.acgn.at/*
 // @match        https://bbs2.kdays.net/*
 // @match        https://b.schale.moe/*
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_listValues
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
 
+/* global GM_getValue, GM_setValue, GM_listValues, module */
 (function () {
   "use strict";
-
-  const PAGE_DELAY_MS = 600;
+  const PREFIX = "shrine.v2.";
   const CREDIT_PATH = "/my/credit";
   const AUTO_SCAN_HASH = "#shrine-collector-scan";
-  const BBT_EXCHANGE_KB = Object.freeze({ buy: 25, sell: 20 });
-  const STORE = {
-    privateKey: "shrine.privateKeyPkcs8.v1",
-    publicKey: "shrine.publicKeySpki.v1",
-    scanState: "shrine.scanState.v1",
-    lastBundle: "shrine.lastBundle.v1",
-    legacyExportState: "shrine.exportState.v4",
-    panelCollapsed: "shrine.panelCollapsed.v1",
-  };
-
-  const SHRINE_RE = /神社\s*(?:时运|時運)?\s*事件/i;
-  const SHRINE_COST_RE = /^神社\s*(?:时运|時運)?\s*事件\s*[:：]\s*cost\s*$/i;
-  const TYPE_KB_RE = /坑币|坑幣/i;
-  const TYPE_BBT_RE = /棒棒糖/i;
-
-  let scanState = null;
-  let busy = false;
-  let statusElement;
-  let panelHost = null;
-  let actionButtons = [];
-
-  function textOf(node) {
-    return (node?.textContent || "").replace(/\s+/g, " ").trim();
-  }
-
-  function normalizeText(value) {
-    return String(value ?? "").replace(/\s+/g, " ").trim();
-  }
+  const PAGE_DELAY_MS = 600;
+  const TIMEOUT_MS = 20000;
+  const MAX_RETRIES = 2;
+  const LEASE_MS = 60000;
+  const clone = (value) => JSON.parse(JSON.stringify(value));
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const textOf = (node) => (node?.textContent ?? "").replace(/\s+/g, " ").trim();
+  const fail = (message) => { throw new Error(message); };
+  const integer = Number.isSafeInteger;
 
   function canonicalize(value) {
     if (value === null || typeof value !== "object") return JSON.stringify(value);
     if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(",")}}`;
   }
-
+  function exactKeys(value, keys, label) {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== keys.length || !keys.every((key) => Object.hasOwn(value, key))) fail(`${label} 字段无效`);
+  }
+  function timestamp(value) {
+    if (typeof value !== "string") fail("日志时间无效");
+    const match = value.trim().match(/^(20\d{2})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})(?::(\d{2}))?$/);
+    if (!match) fail(`无法识别日志时间：${value}`);
+    const result = `${match[1]}-${match[2]}-${match[3]} ${match[4]}:${match[5]}${match[6] ? `:${match[6]}` : ""}`;
+    // Validate the calendar, without assigning a timezone to the forum's displayed time.
+    const iso = `${result.replace(" ", "T")}${match[6] ? "" : ":00"}Z`;
+    const date = new Date(iso);
+    if (!Number.isFinite(date.valueOf()) || date.toISOString().slice(0, 19) !== iso.slice(0, 19)) fail("日志日期无效");
+    return result;
+  }
+  function delta(value, metric) {
+    const unit = metric === 0 ? "(?:KB)?" : "(?:BBT|根)?";
+    const match = String(value).trim().replace(/−/g, "-").match(new RegExp(`^([+-]?\\d+)\\s*${unit}$`, "i"));
+    if (!match || !integer(Number(match[1]))) fail(`无法识别神社积分变动：${value}`);
+    return Number(match[1]);
+  }
+  // Only shrine rows survive extraction: [metric, delta, number|'cost'].
+  function parseRow(type, change, description) {
+    description = description.trim();
+    if (!/神社\s*时运\s*事件/.test(description)) return null;
+    const match = description.match(/^神社\s*时运\s*事件(?:\s*[:：]\s*(cost|\d+))?$/i);
+    if (!match) fail(`无法识别神社说明：${description}`);
+    const metric = /^(坑币|坑幣)$/.test(type.trim()) ? 0 : type.trim() === "棒棒糖" ? 1 : -1;
+    if (metric < 0) fail(`神社条目出现不支持的积分类型：${type}`);
+    const kind = match[1]?.toLowerCase() === "cost" ? "cost" : match[1] === undefined ? -1 : Number(match[1]);
+    const row = [metric, delta(change, metric), kind];
+    validateRow(row);
+    return row;
+  }
+  function validateRow(row) {
+    if (!Array.isArray(row) || row.length !== 3 || ![0, 1].includes(row[0]) || !integer(row[1])
+      || !(row[2] === "cost" || (integer(row[2]) && row[2] >= -1))) fail("神社条目无效");
+  }
+  function validateEvent(event) {
+    exactKeys(event, ["num", "cost", "res", "time"], "事件");
+    if (!integer(event.num) || event.num < -1 || !integer(event.cost) || event.cost < 0 || event.cost > 6
+      || !Array.isArray(event.res) || event.res.length !== 2 || !integer(event.res[0]) || !integer(event.res[1])
+      || timestamp(event.time) !== event.time) fail("事件内容无效");
+    return event;
+  }
+  function combineBlock(time, rows) {
+    timestamp(time);
+    if (!rows.length) return null;
+    let cost = 0;
+    let results = 0;
+    const res = [0, 0];
+    const numbers = new Set();
+    for (const row of rows) {
+      validateRow(row);
+      const [metric, value, kind] = row;
+      if (kind === "cost") {
+        if (metric !== 0 || value > 0) fail(`${time}：奉纳条目必须是 KB 扣款`);
+        cost -= value;
+        if (!integer(cost) || cost > 6) fail(`${time}：奉纳合计不在 0–6 KB 内`);
+      } else {
+        results++;
+        res[metric] += value;
+        if (!integer(res[metric])) fail("神社结果超出安全整数范围");
+        if (kind >= 0) numbers.add(kind);
+      }
+    }
+    if (!results) fail(`${time}：只有奉纳，没有结果条目；无法确认是否为零结果`);
+    if (numbers.size > 1) fail(`${time}：同一显示时间存在不同事件编号`);
+    return validateEvent({ num: numbers.size ? [...numbers][0] : -1, cost, res, time });
+  }
+  const emptyTotals = () => ({ totalDraw: 0, totalCost: 0, totalResult: [0, 0] });
+  function addEvent(totals, event) {
+    totals.totalDraw++;
+    totals.totalCost += event.cost;
+    totals.totalResult[0] += event.res[0];
+    totals.totalResult[1] += event.res[1];
+    if (![totals.totalDraw, totals.totalCost, ...totals.totalResult].every(integer)) fail("累计值超出安全整数范围");
+  }
+  function validateTotals(totals) {
+    exactKeys(totals, ["totalDraw", "totalCost", "totalResult"], "累计统计");
+    if (!integer(totals.totalDraw) || totals.totalDraw < 0 || !integer(totals.totalCost)
+      || totals.totalCost < 0 || totals.totalCost > 6 * totals.totalDraw
+      || !Array.isArray(totals.totalResult) || totals.totalResult.length !== 2
+      || !integer(totals.totalResult[0]) || !integer(totals.totalResult[1])) fail("累计统计无效");
+  }
+  const lifetimeOf = (totals) => ({ totalDraw: totals.totalDraw, totalCost: totals.totalCost, totalResult: [...totals.totalResult] });
   function bytesToBase64Url(bytes) {
     let binary = "";
-    const data = new Uint8Array(bytes);
-    for (let i = 0; i < data.length; i += 0x8000) {
-      binary += String.fromCharCode(...data.subarray(i, i + 0x8000));
-    }
-    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    const array = new Uint8Array(bytes);
+    for (let offset = 0; offset < array.length; offset += 8192) binary += String.fromCharCode(...array.subarray(offset, offset + 8192));
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
-
   function base64UrlToBytes(value) {
-    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
-    const binary = atob(padded);
-    return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) fail("签名编码无效");
+    const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+    const bytes = Uint8Array.from(atob(base64 + "=".repeat((4 - base64.length % 4) % 4)), (ch) => ch.charCodeAt(0));
+    if (bytesToBase64Url(bytes) !== value) fail("签名编码不规范");
+    return bytes;
   }
-
-  async function sha256Bytes(value) {
-    const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
-    return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  async function digest(value) {
+    return bytesToBase64Url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(typeof value === "string" ? value : canonicalize(value))));
   }
-
-  async function sha256Base64Url(value) {
-    return bytesToBase64Url(await sha256Bytes(value));
+  const validHash = (value) => typeof value === "string" && /^[A-Za-z0-9_-]{43}$/.test(value);
+  const validRef = (value) => value === null || validHash(value);
+  const importPublic = (publicKey) => crypto.subtle.importKey("spki", base64UrlToBytes(publicKey), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  async function sign(key, content, local = false) {
+    const bytes = new TextEncoder().encode((local ? "shrine-local-v2\n" : "") + canonicalize(content));
+    return bytesToBase64Url(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, bytes));
   }
-
-  async function getIdentity() {
-    let privateKeyPkcs8 = GM_getValue(STORE.privateKey, "");
-    let publicKeySpki = GM_getValue(STORE.publicKey, "");
-    if (!privateKeyPkcs8 || !publicKeySpki) {
-      const pair = await crypto.subtle.generateKey(
-        { name: "ECDSA", namedCurve: "P-256" },
-        true,
-        ["sign", "verify"],
-      );
-      privateKeyPkcs8 = bytesToBase64Url(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
-      publicKeySpki = bytesToBase64Url(await crypto.subtle.exportKey("spki", pair.publicKey));
-      GM_setValue(STORE.privateKey, privateKeyPkcs8);
-      GM_setValue(STORE.publicKey, publicKeySpki);
-    }
-    const publicDigest = await sha256Bytes(base64UrlToBytes(publicKeySpki));
-    const contributorId = `shrine-${bytesToBase64Url(publicDigest.subarray(0, 18))}`;
-    return { privateKeyPkcs8, publicKeySpki, contributorId };
-  }
-
-  async function signContent(privateKeyPkcs8, content) {
-    const key = await crypto.subtle.importKey(
-      "pkcs8",
-      base64UrlToBytes(privateKeyPkcs8),
-      { name: "ECDSA", namedCurve: "P-256" },
-      false,
-      ["sign"],
-    );
-    const signature = await crypto.subtle.sign(
-      { name: "ECDSA", hash: "SHA-256" },
-      key,
-      new TextEncoder().encode(canonicalize(content)),
-    );
-    return bytesToBase64Url(signature);
-  }
-
-  async function verifyContentSignature(publicKeySpki, content, signature) {
+  async function verify(key, content, signature, local = false) {
     try {
-      const key = await crypto.subtle.importKey(
-        "spki",
-        base64UrlToBytes(publicKeySpki),
-        { name: "ECDSA", namedCurve: "P-256" },
-        false,
-        ["verify"],
-      );
-      return crypto.subtle.verify(
-        { name: "ECDSA", hash: "SHA-256" },
-        key,
-        base64UrlToBytes(signature),
-        new TextEncoder().encode(canonicalize(content)),
-      );
-    } catch {
-      return false;
+      return await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, base64UrlToBytes(signature),
+        new TextEncoder().encode((local ? "shrine-local-v2\n" : "") + canonicalize(content)));
+    } catch { return false; }
+  }
+  async function createIdentity(kv) {
+    let saved = await kv.get(`${PREFIX}identity`, null);
+    if (saved === null) {
+      if ((await kv.keys()).some((key) => key.startsWith(`${PREFIX}snapshot.`) || key.startsWith(`${PREFIX}share.`)
+        || key === `${PREFIX}shareHead`)) fail("签名身份缺失，不能自动替换已有身份；请保留数据后检查存储");
+      const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+      saved = { publicKey: bytesToBase64Url(await crypto.subtle.exportKey("spki", pair.publicKey)), privateKey: bytesToBase64Url(await crypto.subtle.exportKey("pkcs8", pair.privateKey)) };
+      await kv.set(`${PREFIX}identity`, saved);
+      if (canonicalize(await kv.get(`${PREFIX}identity`, null)) !== canonicalize(saved)) fail("签名身份保存失败");
     }
+    exactKeys(saved, ["publicKey", "privateKey"], "签名身份");
+    const publicCryptoKey = await importPublic(saved.publicKey);
+    const privateCryptoKey = await crypto.subtle.importKey("pkcs8", base64UrlToBytes(saved.privateKey), { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+    if (!await verify(publicCryptoKey, "identity-check", await sign(privateCryptoKey, "identity-check", true), true)) fail("本地公私钥不匹配");
+    return { publicKey: saved.publicKey, publicCryptoKey, privateCryptoKey };
   }
-
-  function parseSignedInteger(value, metric = null) {
-    const compact = normalizeText(value).replace(/−/g, "-");
-    const match = compact.match(/^([+-]?(?:\d+|\d{1,3}(?:,\d{3})+))\s*(KB|根)?$/i);
-    if (!match) return null;
-    const unit = match[2]?.toLowerCase() ?? null;
-    if ((metric === "kb" && unit && unit !== "kb")
-      || (metric === "bbt" && unit && unit !== "根")) return null;
-    const number = Number.parseInt(match[1].replace(/,/g, ""), 10);
-    return Number.isSafeInteger(number) ? number : null;
-  }
-
-  function parseShrineEventNumber(description) {
-    const match = description.match(/神社\s*(?:时运|時運)?\s*事件\s*[:：]\s*(\d+)\s*$/i);
-    if (!match) return null;
-    const value = Number(match[1]);
-    return Number.isSafeInteger(value) && value >= 0 ? value : null;
-  }
-
-  function parseLocalTimestamp(value) {
-    const normalized = normalizeText(value);
-    const match = normalized.match(/(20\d{2})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})(?:\s*日)?\s+(\d{1,2})\s*[:：]\s*(\d{2})/);
-    if (!match) return null;
-    const timestamp = `${match[1]}-${String(match[2]).padStart(2, "0")}-${String(match[3]).padStart(2, "0")} ${String(match[4]).padStart(2, "0")}:${match[5]}`;
-    const parsed = new Date(`${timestamp.replace(" ", "T")}:00Z`);
-    return Number.isFinite(parsed.valueOf()) && parsed.toISOString().slice(0, 16).replace("T", " ") === timestamp
-      ? timestamp
-      : null;
-  }
-
-  function detectMetric(typeText) {
-    if (TYPE_KB_RE.test(typeText)) return "kb";
-    if (TYPE_BBT_RE.test(typeText)) return "bbt";
-    return null;
-  }
-
-  function locateCreditTable(doc) {
-    for (const table of doc.querySelectorAll("table")) {
-      const rows = [...table.querySelectorAll("tr")];
-      if (!rows.length) continue;
-      for (let headerRowIndex = 0; headerRowIndex < Math.min(rows.length, 5); headerRowIndex++) {
-        const headers = [...rows[headerRowIndex].querySelectorAll("th,td")].map(textOf);
-        const lower = headers.map((x) => x.toLowerCase());
-        const find = (...needles) => lower.findIndex((value) => needles.some((needle) => value.includes(needle)));
-        const columns = {
-          type: find("类型", "類型"),
-          delta: find("变动", "變動", "变化", "變化"),
-          description: find("说明", "說明", "描述"),
-          time: find("时间", "時間"),
-        };
-        if (Object.values(columns).every((index) => index >= 0)) {
-          return { table, rows, columns, headerRowIndex };
-        }
-      }
-    }
-    return null;
-  }
-
-  function fastHashText(value) {
-    let hashA = 0x811c9dc5;
-    let hashB = 0x9e3779b9;
-    for (let index = 0; index <= value.length; index++) {
-      const code = index < value.length ? value.charCodeAt(index) : 0x241e;
-      hashA = Math.imul(hashA ^ code, 0x01000193) >>> 0;
-      hashB = Math.imul(hashB ^ code, 0x85ebca6b) >>> 0;
-    }
-    return `${hashA.toString(16)}:${hashB.toString(16)}`;
-  }
-
-  function extractPage(doc) {
-    const found = locateCreditTable(doc);
-    if (!found) throw new Error("没有找到积分日志表格；请确认已打开积分记录页面并等待加载完成。");
-    const entries = [];
-    for (let rowIndex = found.headerRowIndex + 1; rowIndex < found.rows.length; rowIndex++) {
-      const cells = [...found.rows[rowIndex].querySelectorAll("th,td")];
-      const maxIndex = Math.max(...Object.values(found.columns));
-      if (cells.length <= maxIndex) continue;
-      const description = textOf(cells[found.columns.description]);
-      const timeText = textOf(cells[found.columns.time]);
-      entries.push({
-        token: fastHashText(textOf(found.rows[rowIndex])),
-        time: parseLocalTimestamp(timeText),
-        shrineRow: SHRINE_RE.test(description) ? {
-          typeText: textOf(cells[found.columns.type]),
-          deltaText: textOf(cells[found.columns.delta]),
-          description,
-          timeText,
-        } : null,
-      });
-    }
-    return entries;
-  }
-
-  function groupRowsByTime(rows) {
-    const blocks = [];
-    for (const row of rows) {
-      const time = parseLocalTimestamp(row.timeText);
-      const key = time === null ? `invalid:${normalizeText(row.timeText)}` : `time:${time}`;
-      const current = blocks[blocks.length - 1];
-      if (current && current.key === key) {
-        current.rows.push(row);
-      } else {
-        blocks.push({ key, time, rows: [row] });
-      }
-    }
-    return blocks;
-  }
-
-  function paginationState() {
-    const found = locateCreditTable(document);
-    const root = found?.table.closest("section.tab-panel")?.querySelector(".log-pagination .pagination");
-    if (!root) return null;
-    const pages = [...root.querySelectorAll(".pagination-main button")]
-      .map((button) => ({ button, pageNumber: Number(textOf(button)) }))
-      .filter((item) => Number.isSafeInteger(item.pageNumber) && item.pageNumber >= 1);
-    const active = pages.find((item) => item.button.classList.contains("kd-btn--primary"));
-    const jumpInput = root.querySelector("input.jump-input");
-    const jumpButton = root.querySelector(".pagination-jumper button");
-    return {
-      activePage: active?.pageNumber ?? null,
-      totalPages: pages.length ? Math.max(...pages.map((item) => item.pageNumber)) : null,
-      pages,
-      jumpInput,
-      jumpButton,
-    };
-  }
-
-  function currentTableSignature() {
-    const found = locateCreditTable(document);
-    if (!found) return null;
-    const dataRows = found.rows.slice(found.headerRowIndex + 1);
-    return `${dataRows.length}:${fastHashText(dataRows.map(textOf).join("\u241e"))}`;
-  }
-
-  function waitForPage(targetPage, previousSignature, timeoutMs = 20000) {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (error) => {
-        if (settled) return;
-        settled = true;
-        observer.disconnect();
-        clearTimeout(timer);
-        if (error) reject(error);
-        else resolve();
-      };
-      const check = () => {
-        const signature = currentTableSignature();
-        if (paginationState()?.activePage === targetPage
-          && signature
-          && signature !== previousSignature) finish();
-      };
-      const observer = new MutationObserver(check);
-      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-      const timer = setTimeout(() => finish(new Error("分页后表格没有在预期时间内更新")), timeoutMs);
-      check();
-    });
-  }
-
-  function waitForJumpButton(timeoutMs = 3000) {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (error, button) => {
-        if (settled) return;
-        settled = true;
-        observer.disconnect();
-        clearTimeout(timer);
-        if (error) reject(error);
-        else resolve(button);
-      };
-      const check = () => {
-        const button = paginationState()?.jumpButton;
-        if (button && !button.disabled) finish(null, button);
-      };
-      const observer = new MutationObserver(check);
-      observer.observe(document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ["disabled"],
-      });
-      const timer = setTimeout(() => finish(new Error("分页跳转按钮没有启用")), timeoutMs);
-      check();
-    });
-  }
-
-  async function jumpToPage(targetPage) {
-    const state = paginationState();
-    if (!state) {
-      if (targetPage === 1) return;
-      throw new Error("没有找到积分日志分页器");
-    }
-    if (state.activePage === targetPage) return;
-    if (state.totalPages === null) {
-      throw new Error("积分日志分页器结构不完整");
-    }
-    if (targetPage < 1 || targetPage > state.totalPages) {
-      throw new Error(`无效页码：${targetPage}`);
-    }
-
-    const before = currentTableSignature();
-    const directButton = state.pages.find((item) => item.pageNumber === targetPage)?.button;
-    if (directButton && !directButton.disabled) {
-      directButton.click();
-      await waitForPage(targetPage, before);
-      return;
-    }
-    if (!state.jumpInput || !state.jumpButton) throw new Error("积分日志跳页控件结构不完整");
-    const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(state.jumpInput), "value")?.set;
-    if (valueSetter) valueSetter.call(state.jumpInput, String(targetPage));
-    else state.jumpInput.value = String(targetPage);
-    state.jumpInput.dispatchEvent(new Event("input", { bubbles: true }));
-    state.jumpInput.dispatchEvent(new Event("change", { bubbles: true }));
-    const jumpButton = await waitForJumpButton();
-    jumpButton.click();
-    await waitForPage(targetPage, before);
-  }
-
-  function combineRows(allRows) {
-    const relevant = allRows.filter((row) => SHRINE_RE.test(row.description));
-    const recordsByKey = new Map();
-    let invalidGroupCount = 0;
-    for (const block of groupRowsByTime(relevant)) {
-      const costRows = block.rows.filter((row) => SHRINE_COST_RE.test(row.description));
-      if (!costRows.length) continue;
-      const resultRows = block.rows.filter((row) => !SHRINE_COST_RE.test(row.description));
-      const eventNumbers = resultRows.map((row) => parseShrineEventNumber(row.description));
-      const distinctEventNumbers = new Set(eventNumbers.filter((value) => value !== null));
-      const parsedResultRows = resultRows.map((row) => {
-        const metric = detectMetric(row.typeText);
-        return { metric, delta: parseSignedInteger(row.deltaText, metric) };
-      });
-      const kbValues = parsedResultRows.filter((row) => row.metric === "kb").map((row) => row.delta);
-      const bbtValues = parsedResultRows.filter((row) => row.metric === "bbt").map((row) => row.delta);
-      const costMetric = costRows.length === 1 ? detectMetric(costRows[0].typeText) : null;
-      const costDelta = costRows.length === 1 ? parseSignedInteger(costRows[0].deltaText, costMetric) : null;
-      const costKb = costMetric === "kb" && costDelta !== null && costDelta < 0 && Math.abs(costDelta) >= 1 && Math.abs(costDelta) <= 6
-        ? Math.abs(costDelta)
-        : null;
-      const hasAnyResultRow = parsedResultRows.length > 0;
-      const hasInvalidResultRow = parsedResultRows.some((row) => !row.metric || row.delta === null);
-      const eventNumber = distinctEventNumbers.size === 1 ? [...distinctEventNumbers][0] : null;
-      const time = block.time;
-      if (costKb === null
-        || eventNumber === null
-        || eventNumbers.some((value) => value === null)
-        || time === null
-        || !hasAnyResultRow
-        || hasInvalidResultRow) {
-        invalidGroupCount++;
-        continue;
-      }
-      const event = {
-        eventNumber,
-        costKb,
-        resultVector: {
-          kb: kbValues.reduce((sum, value) => sum + value, 0),
-          bbt: bbtValues.reduce((sum, value) => sum + value, 0),
-        },
-        time,
-      };
-      const recordKey = canonicalize({ time, eventNumber: event.eventNumber, costKb });
-      const existing = recordsByKey.get(recordKey);
-      if (existing && canonicalize(existing) !== canonicalize(event)) {
-        throw new Error("同一次抽奖出现了互相冲突的结果");
-      }
-      recordsByKey.set(recordKey, event);
-    }
-    if (invalidGroupCount) throw new Error(`发现 ${invalidGroupCount} 个无法可靠配对的神社事件；本次扫描未保存`);
-    return [...recordsByKey.values()].sort((a, b) => a.time.localeCompare(b.time)
-      || a.eventNumber - b.eventNumber
-      || a.costKb - b.costKb);
-  }
-
-  function addLifetimeRows(base, rows) {
-    const net = { kb: base.kb, bbt: base.bbt };
-    let ignoredMetricRows = 0;
-    for (const row of rows) {
-      const metric = detectMetric(row.typeText);
-      if (!metric) {
-        ignoredMetricRows++;
-        continue;
-      }
-      const delta = parseSignedInteger(row.deltaText, metric);
-      if (delta === null) throw new Error("发现无法识别的神社积分变动；本次扫描未保存");
-      net[metric] += delta;
-      if (!Number.isSafeInteger(net[metric])) throw new Error("神社生涯净收入超出安全整数范围");
-    }
-    return { net, ignoredMetricRows };
-  }
-
-  function emptyModernStats() {
-    return { count: 0, meanResultKb: 0, squaredDeviationSum: 0, totalResultKb: 0, totalCostKb: 0 };
-  }
-
-  function addModernNet(base, records) {
-    const net = { ...base };
-    for (const record of records) {
-      net.kb += record.resultVector.kb - record.costKb;
-      net.bbt += record.resultVector.bbt;
-      if (!Number.isSafeInteger(net.kb) || !Number.isSafeInteger(net.bbt)) {
-        throw new Error("新版神社净收入超出安全整数范围");
-      }
-    }
-    return net;
-  }
-
-  function addRecordStats(base, records) {
-    const stats = { ...base };
-    for (const record of records) {
-      const bbtValueKb = record.resultVector.bbt * BBT_EXCHANGE_KB.sell;
-      const resultKb = record.resultVector.kb + bbtValueKb;
-      if (!Number.isSafeInteger(resultKb) || !Number.isSafeInteger(record.costKb)) {
-        throw new Error("新版事件统计超出安全整数范围");
-      }
-      stats.count++;
-      stats.totalResultKb += resultKb;
-      stats.totalCostKb += record.costKb;
-      const delta = resultKb - stats.meanResultKb;
-      stats.meanResultKb += delta / stats.count;
-      stats.squaredDeviationSum += delta * (resultKb - stats.meanResultKb);
-      if (!Number.isSafeInteger(stats.count)
-        || !Number.isSafeInteger(stats.totalResultKb)
-        || !Number.isSafeInteger(stats.totalCostKb)
-        || !Number.isFinite(stats.meanResultKb)
-        || !Number.isFinite(stats.squaredDeviationSum)) {
-        throw new Error("新版事件累计统计超出安全范围");
-      }
-    }
-    return stats;
-  }
-
-  function summarizeRecords(records) {
-    const stats = addRecordStats(emptyModernStats(), records);
-    if (!stats.count) return null;
-    return {
-      ...stats,
-      sampleVarianceKb2: stats.count >= 2 ? stats.squaredDeviationSum / (stats.count - 1) : null,
-      shrineNetIncomeKb: stats.totalResultKb - stats.totalCostKb,
-    };
-  }
-
-  function formatStatistic(value) {
-    const normalized = Math.abs(value) < 0.0005 ? 0 : value;
-    return normalized.toFixed(3).replace(/\.?0+$/, "");
-  }
-
-  function formatScanSummary(pageCount, newEventCount, state, ignoredMetricRows) {
-    const stats = state.modernStats;
-    const sampleVariance = stats.count >= 2 ? stats.squaredDeviationSum / (stats.count - 1) : null;
-    const lines = [
-      `完成：读取 ${pageCount} 页，本次新增 ${newEventCount} 次。`,
-      `新版神社结果样本均值：${stats.count ? `${formatStatistic(stats.meanResultKb)} KB` : "暂无样本"}`,
-      `新版神社结果标准差：${sampleVariance !== null ? `${formatStatistic(Math.sqrt(sampleVariance))} KB` : "至少需要2次抽奖"}`,
-      `新版神社净收入：${state.modernNet ? `${state.modernNet.kb} KB，${state.modernNet.bbt} BBT` : "待补全"}（${stats.count} 次抽奖）`,
-      `生涯神社净收入：${state.lifetimeNet.kb} KB，${state.lifetimeNet.bbt} BBT（${state.lifetimeDrawCount === null ? "次数待补全" : `共 ${state.lifetimeDrawCount} 次抽奖`}）`,
-    ];
-    if (ignoredMetricRows) lines.push(`本次另有 ${ignoredMetricRows} 条其他积分类型的神社记录未计入净收入。`);
-    return lines.join("\n");
-  }
-
-  function normalizeEventRecord(record) {
-    const normalized = {
-      eventNumber: record?.eventNumber,
-      costKb: record?.costKb,
-      resultVector: { kb: record?.resultVector?.kb, bbt: record?.resultVector?.bbt },
-      time: record?.time,
-    };
-    if (!Number.isSafeInteger(normalized.eventNumber)
-      || normalized.eventNumber < 0
-      || !Number.isSafeInteger(normalized.costKb)
-      || normalized.costKb < 1
-      || normalized.costKb > 6
-      || !Number.isSafeInteger(normalized.resultVector.kb)
-      || !Number.isSafeInteger(normalized.resultVector.bbt)
-      || typeof normalized.time !== "string"
-      || parseLocalTimestamp(normalized.time) !== normalized.time) {
-      throw new Error("扫描状态中存在无效事件");
-    }
-    return normalized;
-  }
-
-  function emptyScanState() {
-    return {
-      version: 1,
-      coveredThrough: null,
-      boundaryRowHashes: [],
-      boundaryEvents: [],
-      lifetimeNet: { kb: 0, bbt: 0 },
-      lifetimeDrawCount: 0,
-      modernNet: { kb: 0, bbt: 0 },
-      modernStats: emptyModernStats(),
-      pendingEvents: [],
-      share: emptyShareState(),
-    };
-  }
-
-  function emptyShareState() {
-    return { lastSequence: 0, lastBundleHash: null, lastBundle: null };
-  }
-
-  function normalizeLifetime(lifetime, events = []) {
-    if (!lifetime || typeof lifetime !== "object" || Array.isArray(lifetime)
-      || Object.keys(lifetime).some((key) => !["through", "drawCount", "net"].includes(key))
-      || typeof lifetime.through !== "string"
-      || parseLocalTimestamp(lifetime.through) !== lifetime.through
-      || !Number.isSafeInteger(lifetime.drawCount) || lifetime.drawCount < events.length
-      || !lifetime.net || typeof lifetime.net !== "object" || Array.isArray(lifetime.net)
-      || Object.keys(lifetime.net).some((key) => !["kb", "bbt"].includes(key))
-      || !Number.isSafeInteger(lifetime.net.kb) || !Number.isSafeInteger(lifetime.net.bbt)
-      || (lifetime.drawCount === 0 && (lifetime.net.kb !== 0 || lifetime.net.bbt !== 0))
-      || events.some((event) => event.time > lifetime.through)) {
-      throw new Error("生涯汇总无效或与新版记录不一致；请先完成扫描以补全生涯记录。");
-    }
-    return {
-      through: lifetime.through,
-      drawCount: lifetime.drawCount,
-      net: { kb: lifetime.net.kb, bbt: lifetime.net.bbt },
-    };
-  }
-
-  function signedBundleContent(bundle) {
-    const { publicKey, sequence, previousBundleHash, events } = bundle;
-    const content = { publicKey, sequence, previousBundleHash, events };
-    // Old six-field bundles must retain their original signed payload.
-    if (Object.prototype.hasOwnProperty.call(bundle, "lifetime")) content.lifetime = bundle.lifetime;
-    return content;
-  }
-
-  function normalizeSavedBundle(bundle) {
-    if (bundle === null) return null;
-    if (!bundle || typeof bundle !== "object" || Array.isArray(bundle)) {
-      throw new Error("本地上一数据包无效");
-    }
-    const normalized = {
-      publicKey: bundle.publicKey,
-      sequence: bundle.sequence,
-      previousBundleHash: bundle.previousBundleHash,
-      events: Array.isArray(bundle.events) ? bundle.events.map(normalizeEventRecord) : null,
-      signature: bundle.signature,
-      bundleHash: bundle.bundleHash,
-    };
-    if (Object.prototype.hasOwnProperty.call(bundle, "lifetime")) {
-      normalized.lifetime = normalizeLifetime(bundle.lifetime, normalized.events ?? []);
-    }
-    if (typeof normalized.publicKey !== "string"
-      || !Number.isSafeInteger(normalized.sequence)
-      || normalized.sequence < 1
-      || !(normalized.previousBundleHash === null
-        || (typeof normalized.previousBundleHash === "string" && /^[A-Za-z0-9_-]{43}$/.test(normalized.previousBundleHash)))
-      || (normalized.sequence === 1 && normalized.previousBundleHash !== null)
-      || (normalized.sequence > 1 && normalized.previousBundleHash === null)
-      || !normalized.events || (!normalized.events.length && !normalized.lifetime)
-      || typeof normalized.signature !== "string"
-      || !/^[A-Za-z0-9_-]+$/.test(normalized.signature)
-      || typeof normalized.bundleHash !== "string"
-      || !/^[A-Za-z0-9_-]{43}$/.test(normalized.bundleHash)) {
-      throw new Error("本地上一数据包无效");
-    }
-    return normalized;
-  }
-
-  function normalizeScanState(content) {
-    if (!content || typeof content !== "object" || Array.isArray(content) || content.version !== 1) {
-      throw new Error("本地扫描状态格式不受支持");
-    }
-    const coveredThrough = content.coveredThrough === null ? null : parseLocalTimestamp(content.coveredThrough);
-    if (coveredThrough !== content.coveredThrough) throw new Error("本地扫描时间无效");
-    const boundaryRowHashes = Array.isArray(content.boundaryRowHashes)
-      ? [...content.boundaryRowHashes].sort() : null;
-    if (!boundaryRowHashes
-      || boundaryRowHashes.some((value) => typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value))) {
-      throw new Error("本地扫描边界无效");
-    }
-    if (coveredThrough === null && boundaryRowHashes.length) throw new Error("本地扫描边界与时间不一致");
-    const boundaryEvents = Array.isArray(content.boundaryEvents ?? [])
-      ? mergePendingEvents([], content.boundaryEvents ?? []) : null;
-    if (!boundaryEvents
-      || boundaryEvents.some((record) => record.time !== coveredThrough)) {
-      throw new Error("本地扫描边界事件无效");
-    }
-    const lifetimeNet = {
-      kb: content.lifetimeNet?.kb,
-      bbt: content.lifetimeNet?.bbt,
-    };
-    if (!Number.isSafeInteger(lifetimeNet.kb) || !Number.isSafeInteger(lifetimeNet.bbt)) {
-      throw new Error("本地生涯统计无效");
-    }
-    const modernNet = content.modernNet == null ? null : {
-      kb: content.modernNet.kb,
-      bbt: content.modernNet.bbt,
-    };
-    if (modernNet && (!Number.isSafeInteger(modernNet.kb) || !Number.isSafeInteger(modernNet.bbt))) {
-      throw new Error("本地新版净收入无效");
-    }
-    const modernStats = {
-      count: content.modernStats?.count,
-      meanResultKb: content.modernStats?.meanResultKb,
-      squaredDeviationSum: content.modernStats?.squaredDeviationSum,
-      totalResultKb: content.modernStats?.totalResultKb,
-      totalCostKb: content.modernStats?.totalCostKb,
-    };
-    if (!Number.isSafeInteger(modernStats.count)
-      || modernStats.count < 0
-      || !Number.isFinite(modernStats.meanResultKb)
-      || !Number.isFinite(modernStats.squaredDeviationSum)
-      || modernStats.squaredDeviationSum < -1e-9
-      || !Number.isSafeInteger(modernStats.totalResultKb)
-      || !Number.isSafeInteger(modernStats.totalCostKb)
-      || modernStats.totalCostKb < 0
-      || (modernStats.count === 0
-        && (modernStats.meanResultKb !== 0
-          || modernStats.squaredDeviationSum !== 0
-          || modernStats.totalResultKb !== 0
-          || modernStats.totalCostKb !== 0))
-      || (modernStats.count > 0
-        && (modernStats.totalCostKb < modernStats.count
-          || modernStats.totalCostKb > modernStats.count * 6
-          || Math.abs(modernStats.meanResultKb - modernStats.totalResultKb / modernStats.count)
-            > 1e-9 * Math.max(1, Math.abs(modernStats.meanResultKb))))) {
-      throw new Error("本地新版统计无效");
-    }
-    modernStats.squaredDeviationSum = Math.max(0, modernStats.squaredDeviationSum);
-    // Pre-1.0.1 state has totals but no historical draw count; keep it for one-time backfill.
-    const lifetimeDrawCount = content.lifetimeDrawCount ?? null;
-    if (lifetimeDrawCount !== null
-      && (!Number.isSafeInteger(lifetimeDrawCount) || lifetimeDrawCount < modernStats.count)) {
-      throw new Error("本地生涯抽奖次数无效");
-    }
-    const pendingEvents = Array.isArray(content.pendingEvents)
-      ? mergePendingEvents([], content.pendingEvents) : null;
-    if (!pendingEvents) throw new Error("本地待分享记录无效");
-    const rawShare = content.share ?? { lastSequence: 0, lastBundleHash: null, lastBundle: null };
-    const lastSequence = rawShare.lastSequence;
-    const lastBundleHash = rawShare.lastBundleHash;
-    const lastBundle = normalizeSavedBundle(rawShare.lastBundle ?? null);
-    if (!Number.isSafeInteger(lastSequence)
-      || lastSequence < 0
-      || !(lastBundleHash === null
-        || (typeof lastBundleHash === "string" && /^[A-Za-z0-9_-]{43}$/.test(lastBundleHash)))
-      || (lastSequence === 0 && (lastBundleHash !== null || lastBundle !== null))
-      || (lastSequence > 0 && (!lastBundle
-        || lastBundle.sequence !== lastSequence
-        || lastBundle.bundleHash !== lastBundleHash))) {
-      throw new Error("本地分享进度无效");
-    }
-    return {
-      version: 1,
-      coveredThrough,
-      boundaryRowHashes,
-      boundaryEvents,
-      lifetimeNet,
-      lifetimeDrawCount,
-      modernNet,
-      modernStats,
-      pendingEvents,
-      share: { lastSequence, lastBundleHash, lastBundle },
-    };
-  }
-
-  async function validateSavedBundle(identity, share) {
-    if (!share.lastBundle) return share.lastSequence === 0 && share.lastBundleHash === null;
-    const bundle = share.lastBundle;
-    if (bundle.publicKey !== identity.publicKeySpki) return false;
-    const content = signedBundleContent(bundle);
-    return await verifyContentSignature(bundle.publicKey, content, bundle.signature)
-      && await sha256Base64Url(`${canonicalize(content)}.${bundle.signature}`) === bundle.bundleHash;
-  }
-
-  async function loadShareBackup(identity) {
-    const candidates = [];
-    const savedBundle = GM_getValue(STORE.lastBundle, "");
-    if (savedBundle) {
-      try {
-        candidates.push(JSON.parse(savedBundle));
-      } catch {
-        // Ignore a malformed recovery copy.
-      }
-    }
-    const legacy = GM_getValue(STORE.legacyExportState, "");
-    if (legacy) {
-      try {
-        candidates.push(JSON.parse(legacy).lastBundle);
-      } catch {
-        // Ignore malformed state from a pre-1.0 version.
-      }
-    }
-    for (const candidate of candidates) {
-      try {
-        const lastBundle = normalizeSavedBundle(candidate);
-        if (!lastBundle) continue;
-        const share = {
-          lastSequence: lastBundle.sequence,
-          lastBundleHash: lastBundle.bundleHash,
-          lastBundle,
-        };
-        if (await validateSavedBundle(identity, share)) return share;
-      } catch {
-        // Try the next independently signed candidate.
-      }
-    }
-    return emptyShareState();
-  }
-
-  async function loadScanState(identity) {
-    const stored = GM_getValue(STORE.scanState, "");
-    if (!stored) {
-      const state = emptyScanState();
-      state.share = await loadShareBackup(identity);
-      return { state, restored: false, signatureInvalid: false };
-    }
-    try {
-      const envelope = JSON.parse(stored);
-      const valid = typeof envelope.signature === "string"
-        && await verifyContentSignature(identity.publicKeySpki, envelope.content, envelope.signature);
-      if (!valid) throw new Error("签名不匹配");
-      const content = normalizeScanState(envelope.content);
-      if (!await validateSavedBundle(identity, content.share)) throw new Error("分享链校验失败");
-      return { state: content, restored: true, signatureInvalid: false };
-    } catch (error) {
-      console.warn("[神社研究] 本地扫描状态验签失败，将重新建立", error);
-      const state = emptyScanState();
-      state.share = await loadShareBackup(identity);
-      return { state, restored: false, signatureInvalid: true };
-    }
-  }
-
-  async function saveScanState(identity, content) {
-    const normalized = normalizeScanState(content);
-    if (!await validateSavedBundle(identity, normalized.share)) throw new Error("本地分享进度校验失败");
-    const signature = await signContent(identity.privateKeyPkcs8, normalized);
-    GM_setValue(STORE.scanState, JSON.stringify({ content: normalized, signature }));
-    if (normalized.share.lastBundle) {
-      GM_setValue(STORE.lastBundle, JSON.stringify(normalized.share.lastBundle));
-    }
-    scanState = normalized;
-    return normalized;
-  }
-
-  function mergePendingEvents(existing, additions) {
-    const records = new Map();
-    for (const record of [...existing, ...additions]) {
-      const normalized = normalizeEventRecord(record);
-      const key = canonicalize({
-        time: normalized.time,
-        eventNumber: normalized.eventNumber,
-        costKb: normalized.costKb,
-      });
-      const existingRecord = records.get(key);
-      if (existingRecord && canonicalize(existingRecord) !== canonicalize(normalized)) {
-        throw new Error("待分享记录中同一次抽奖存在冲突");
-      }
-      records.set(key, normalized);
-    }
-    return [...records.values()].sort((a, b) => a.time.localeCompare(b.time)
-      || a.eventNumber - b.eventNumber
-      || a.costKb - b.costKb);
-  }
-
-  function omitEventsInLastBundle(records, share) {
-    if (!share.lastBundle) return records;
-    const shared = new Map(share.lastBundle.events.map((record) => [
-      canonicalize({ time: record.time, eventNumber: record.eventNumber, costKb: record.costKb }),
-      canonicalize(record),
-    ]));
-    return records.filter((record) => {
-      const key = canonicalize({ time: record.time, eventNumber: record.eventNumber, costKb: record.costKb });
-      return shared.get(key) !== canonicalize(record);
-    });
-  }
-
-  function appendPageEntries(target, pageEntries) {
-    let overlap = Math.min(target.length, pageEntries.length);
-    while (overlap > 0) {
-      let matches = true;
-      for (let index = 0; index < overlap; index++) {
-        if (target[target.length - overlap + index].token !== pageEntries[index].token) {
-          matches = false;
-          break;
-        }
-      }
-      if (matches) break;
-      overlap--;
-    }
-    target.push(...pageEntries.slice(overlap));
-    return pageEntries.length - overlap;
-  }
-
-  async function hashShrineRow(row) {
-    const metric = detectMetric(row.typeText);
-    const delta = metric ? parseSignedInteger(row.deltaText, metric) : null;
-    const eventNumber = parseShrineEventNumber(row.description);
-    return sha256Base64Url(canonicalize({
-      type: metric ?? normalizeText(row.typeText),
-      delta: delta ?? normalizeText(row.deltaText),
-      description: SHRINE_COST_RE.test(row.description)
-        ? "cost"
-        : eventNumber ?? normalizeText(row.description),
-      time: parseLocalTimestamp(row.timeText) ?? normalizeText(row.timeText),
-    }));
-  }
-
-  async function buildScanUpdate(previous, mergedEntries, scanUpperBound) {
-    const windowEntries = mergedEntries.filter((entry) => {
-      if (!entry.shrineRow) return false;
-      if (scanUpperBound && entry.time && entry.time > scanUpperBound) return false;
-      if (previous.coveredThrough && entry.time && entry.time < previous.coveredThrough) return false;
-      if (previous.coveredThrough && !entry.time) throw new Error("增量扫描遇到无法解析时间的神社记录");
-      return true;
-    });
-    const hashedRows = await Promise.all(windowEntries.map(async (entry) => ({
-      ...entry,
-      rowHash: await hashShrineRow(entry.shrineRow),
-    })));
-    const previousBoundaryCounts = new Map();
-    for (const hash of previous.boundaryRowHashes) {
-      previousBoundaryCounts.set(hash, (previousBoundaryCounts.get(hash) ?? 0) + 1);
-    }
-    const newRows = hashedRows.filter((entry) => {
-      if (!previous.coveredThrough || entry.time > previous.coveredThrough) return true;
-      if (entry.time !== previous.coveredThrough) return false;
-      const unseenCopies = previousBoundaryCounts.get(entry.rowHash) ?? 0;
-      if (!unseenCopies) return true;
-      previousBoundaryCounts.set(entry.rowHash, unseenCopies - 1);
-      return false;
-    });
-    const parsedRecords = combineRows(hashedRows.map((entry) => entry.shrineRow));
-    const previousBoundaryEvents = new Map(previous.boundaryEvents.map((record) => [
-      canonicalize({ time: record.time, eventNumber: record.eventNumber, costKb: record.costKb }),
-      record,
-    ]));
-    const seenPreviousBoundaryEvents = new Set();
-    const newRecords = parsedRecords.filter((record) => {
-      if (!previous.coveredThrough || record.time > previous.coveredThrough) return true;
-      if (record.time !== previous.coveredThrough) return false;
-      const key = canonicalize({ time: record.time, eventNumber: record.eventNumber, costKb: record.costKb });
-      const existing = previousBoundaryEvents.get(key);
-      if (!existing) return true;
-      seenPreviousBoundaryEvents.add(key);
-      if (canonicalize(existing) !== canonicalize(record)) {
-        throw new Error("已统计的边界事件内容发生变化；本次扫描未保存");
-      }
-      return false;
-    });
-    if (seenPreviousBoundaryEvents.size !== previousBoundaryEvents.size) {
-      throw new Error("已统计的边界事件从日志中消失；本次扫描未保存");
-    }
-    const lifetimeUpdate = addLifetimeRows(previous.lifetimeNet, newRows.map((entry) => entry.shrineRow));
-    const lifetimeDrawCount = countLifetimeDraws(previous, mergedEntries, scanUpperBound);
-    // Old state only retained converted results; recover the two currencies once from full history.
-    const modernNet = previous.modernNet === null
-      ? addModernNet({ kb: 0, bbt: 0 }, combineRows(mergedEntries
-        .filter((entry) => entry.shrineRow && (!scanUpperBound || entry.time <= scanUpperBound))
-        .map((entry) => entry.shrineRow)))
-      : addModernNet(previous.modernNet, newRecords);
-    const coveredThrough = !previous.coveredThrough || (scanUpperBound && scanUpperBound > previous.coveredThrough)
-      ? scanUpperBound : previous.coveredThrough;
-    const boundaryHashes = [];
-    for (const entry of hashedRows) {
-      if (entry.time === coveredThrough) boundaryHashes.push(entry.rowHash);
-    }
-    const boundaryEvents = parsedRecords.filter((record) => record.time === coveredThrough);
-    const pendingAdditions = omitEventsInLastBundle(newRecords, previous.share);
-    return {
-      state: {
-        version: 1,
-        coveredThrough,
-        boundaryRowHashes: boundaryHashes.sort(),
-        boundaryEvents,
-        lifetimeNet: lifetimeUpdate.net,
-        lifetimeDrawCount,
-        modernNet,
-        modernStats: addRecordStats(previous.modernStats, newRecords),
-        pendingEvents: mergePendingEvents(previous.pendingEvents, pendingAdditions),
-        share: previous.share,
-      },
-      newEventCount: newRecords.length,
-      ignoredMetricRows: lifetimeUpdate.ignoredMetricRows,
-    };
-  }
-
-  function countLifetimeDraws(previous, entries, scanUpperBound) {
-    const backfill = previous.lifetimeDrawCount === null;
+  async function verifyBundle(bundle) {
+    exactKeys(bundle, ["publicKey", "sequence", "previousBundleHash", "packedAt", "lifetime", "events", "signature"], "分享包");
+    const { signature, ...content } = bundle;
+    if (!integer(bundle.sequence) || bundle.sequence < 1 || !validRef(bundle.previousBundleHash)
+      || (bundle.sequence === 1) !== (bundle.previousBundleHash === null)) fail("分享包序号或前序哈希无效");
+    if (typeof bundle.packedAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(bundle.packedAt)
+      || new Date(bundle.packedAt).toISOString() !== bundle.packedAt) fail("打包时间无效");
+    validateTotals(bundle.lifetime);
+    const { totalDraw, totalResult } = bundle.lifetime;
+    if (!integer(totalDraw) || totalDraw < 0 || !Array.isArray(totalResult) || totalResult.length !== 2
+      || !totalResult.every(integer) || (totalDraw === 0 && totalResult.some((value) => value !== 0))) fail("生涯汇总无效");
+    if (!Array.isArray(bundle.events) || bundle.events.length > totalDraw) fail("事件数组无效");
     const times = new Set();
-    for (const entry of entries) {
-      if (!entry.shrineRow || (scanUpperBound && entry.time > scanUpperBound)) continue;
-      if (!entry.time) throw new Error("无法根据日志时间统计生涯抽奖次数");
-      if (!backfill && previous.coveredThrough
-        && (entry.time < previous.coveredThrough
-          || (entry.time === previous.coveredThrough && previous.boundaryRowHashes.length))) continue;
-      times.add(entry.time);
+    for (const event of bundle.events) { validateEvent(event); if (times.has(event.time)) fail("分享包内事件时间重复"); times.add(event.time); }
+    if (!await verify(await importPublic(bundle.publicKey), content, signature)) fail("分享包数字签名验证失败");
+    return { hash: await digest(bundle), contributorId: await digest(bundle.publicKey) };
+  }
+
+  function emptyState() {
+    return { revision: 0, parent: null, events: [], baseline: null, job: null };
+  }
+  function sumEvents(events) {
+    const totals = emptyTotals();
+    for (const event of events) addEvent(totals, event);
+    return totals;
+  }
+
+  // Two complete signed snapshots, not a database of pages. The older slot is the backup.
+  class Repository {
+    constructor(kv, identity, assertWriter = async () => {}) {
+      this.kv = kv;
+      this.identity = identity;
+      this.assertWriter = assertWriter;
+      this.state = emptyState();
+      this.head = null;
+      this.events = new Map();
+      this.shared = new Map();
+      this.lastBundle = null;
+      this.notice = "";
+      this.slots = [null, null];
     }
-    return (backfill ? 0 : previous.lifetimeDrawCount) + times.size;
+    totals() { return sumEvents(this.state.events); }
+    baselineTotals() { return sumEvents(this.state.events.slice(0, this.state.baseline?.count ?? 0)); }
+    async envelope(content) {
+      return { content, signature: await sign(this.identity.privateCryptoKey, content, true) };
+    }
+    validateState(state) {
+      exactKeys(state, ["revision", "parent", "events", "baseline", "job"], "扫描快照");
+      if (!integer(state.revision) || state.revision < 1 || !validRef(state.parent) || !Array.isArray(state.events)) fail("扫描快照无效");
+      const times = new Set();
+      for (const event of state.events) {
+        validateEvent(event);
+        if (times.has(event.time)) fail("本地事件时间重复");
+        times.add(event.time);
+      }
+      sumEvents(state.events); // Also verifies overflow in cumulative values.
+      if (state.baseline) {
+        const base = state.baseline;
+        exactKeys(base, ["upper", "count"], "完整扫描基线");
+        if (!integer(base.count) || base.count < 0 || base.count > state.events.length
+          || !(base.upper === null || timestamp(base.upper) === base.upper)
+          || state.events.slice(0, base.count).some((event) => base.upper === null || event.time > base.upper)) fail("完整扫描基线无效");
+      }
+      if (state.job) {
+        const job = state.job;
+        exactKeys(job, ["upper", "cursor"], "扫描任务");
+        if (timestamp(job.upper) !== job.upper || !(job.cursor === null || timestamp(job.cursor) === job.cursor)
+          || (job.cursor !== null && (job.cursor > job.upper || job.cursor.length !== job.upper.length))
+          || (state.baseline?.upper && (job.upper < state.baseline.upper || job.upper.length !== state.baseline.upper.length))) fail("扫描任务边界无效");
+        for (const event of state.events.slice(state.baseline?.count ?? 0)) {
+          if (job.cursor === null || event.time < job.cursor || event.time > job.upper) fail("事件超出已确认扫描区间");
+        }
+      } else if (state.baseline) {
+        if (state.baseline.count !== state.events.length) fail("完整扫描的事件数量不一致");
+      } else if (state.events.length) fail("缺少事件覆盖范围");
+    }
+    async loadShares() {
+      const packages = [];
+      for (const key of (await this.kv.keys()).filter((name) => name.startsWith(`${PREFIX}share.`))) {
+        const bundle = await this.kv.get(key, null);
+        const { hash } = await verifyBundle(bundle);
+        if (key !== `${PREFIX}share.${hash}` || bundle.publicKey !== this.identity.publicKey) fail("本地分享历史校验失败");
+        packages.push({ hash, bundle });
+      }
+      packages.sort((a, b) => a.bundle.sequence - b.bundle.sequence);
+      const shared = new Map();
+      const totals = emptyTotals();
+      let previousHash = null;
+      for (let i = 0; i < packages.length; i++) {
+        const { hash, bundle } = packages[i];
+        if (bundle.sequence !== i + 1 || bundle.previousBundleHash !== previousHash) fail("本地分享历史缺包或分叉，请保留数据后核查");
+        for (const event of bundle.events) {
+          if (shared.has(event.time)) fail("本地分享包重复包含同次事件");
+          shared.set(event.time, canonicalize(event));
+          addEvent(totals, event);
+        }
+        if (canonicalize(lifetimeOf(totals)) !== canonicalize(bundle.lifetime)) fail("本地分享汇总与事件历史不一致");
+        previousHash = hash;
+      }
+      const tip = await this.kv.get(`${PREFIX}shareHead`, null);
+      if (tip !== null) {
+        exactKeys(tip, ["content", "signature"], "分享进度签名");
+        exactKeys(tip.content, ["sequence", "hash"], "分享进度");
+        if (!integer(tip.content.sequence) || tip.content.sequence < 1 || !validHash(tip.content.hash)
+          || !await verify(this.identity.publicCryptoKey, tip.content, tip.signature, true)) fail("分享进度签名无效，请保留数据后核查");
+        if (packages[tip.content.sequence - 1]?.hash !== tip.content.hash) fail("已分享的数据包缺失，请恢复原包；重新扫描不能恢复原签名包");
+      }
+      if (packages.length > (tip?.content.sequence ?? 0) + 1) fail("分享进度缺失或存在多个未确认包，未重置序号");
+      this.shareTip = tip;
+      this.shared = shared;
+      this.lastBundle = packages.at(-1)?.bundle ?? null;
+    }
+    async saveShareHead() {
+      if (!this.lastBundle) return;
+      await this.assertUnchanged();
+      if (canonicalize(await this.kv.get(`${PREFIX}shareHead`, null)) !== canonicalize(this.shareTip)) fail("另一窗口改变了分享进度");
+      const content = { sequence: this.lastBundle.sequence, hash: await digest(this.lastBundle) };
+      if (canonicalize(content) === canonicalize(this.shareTip?.content ?? null)) return;
+      const envelope = await this.envelope(content);
+      await this.assertWriter();
+      await this.kv.set(`${PREFIX}shareHead`, envelope);
+      await this.assertWriter();
+      if (canonicalize(await this.kv.get(`${PREFIX}shareHead`, null)) !== canonicalize(envelope)) fail("分享进度保存失败，尚未下载");
+      this.shareTip = envelope;
+    }
+    async load(rebuild = false) {
+      await this.loadShares();
+      const candidates = [];
+      let damaged = false;
+      for (let index = 0; index < 2; index++) {
+        const envelope = await this.kv.get(`${PREFIX}snapshot.${index}`, null);
+        this.slots[index] = canonicalize(envelope);
+        if (envelope === null) continue;
+        try {
+          exactKeys(envelope, ["content", "signature"], "签名快照");
+          if (!await verify(this.identity.publicCryptoKey, envelope.content, envelope.signature, true)) fail("快照签名无效");
+          this.validateState(envelope.content);
+          if (envelope.content.revision % 2 !== index) fail("快照位置不一致");
+          candidates.push({ state: envelope.content, hash: await digest(envelope) });
+        } catch { damaged = true; }
+      }
+      candidates.sort((a, b) => a.state.revision - b.state.revision);
+      if (candidates.length === 2 && (candidates[1].state.revision !== candidates[0].state.revision + 1
+        || candidates[1].state.parent !== candidates[0].hash)) fail("两个有效快照不属于同一条更新链；请停止其他窗口后核查，未覆盖数据");
+      if (candidates.length) {
+        const chosen = candidates.at(-1);
+        this.state = chosen.state;
+        this.head = chosen.hash;
+        this.events = new Map(this.state.events.map((event) => [event.time, event]));
+        if (damaged) this.notice = "部分本地快照损坏，已恢复有效备份；尾部将重新扫描。";
+        return true;
+      }
+      this.state = emptyState();
+      this.head = null;
+      this.events = new Map();
+      if (damaged) this.notice = "本地快照均失效，需重新扫描；签名身份和分享历史保留。";
+      if (!rebuild) return false;
+      await this.commit(this.state);
+      return true;
+    }
+    async assertUnchanged() {
+      await this.assertWriter();
+      for (let i = 0; i < 2; i++) {
+        if (canonicalize(await this.kv.get(`${PREFIX}snapshot.${i}`, null)) !== this.slots[i]) fail("另一窗口或外部操作改变了扫描数据，请重新校验后继续");
+      }
+    }
+    async commit(next) {
+      await this.assertUnchanged();
+      const state = clone(next);
+      state.revision = this.state.revision + 1;
+      state.parent = this.head;
+      this.validateState(state);
+      const envelope = await this.envelope(state);
+      const index = state.revision % 2;
+      // Signing can take time: verify ownership and predecessor once more before writing.
+      await this.assertUnchanged();
+      await this.kv.set(`${PREFIX}snapshot.${index}`, envelope);
+      await this.assertWriter();
+      const saved = await this.kv.get(`${PREFIX}snapshot.${index}`, null);
+      if (canonicalize(saved) !== canonicalize(envelope)) fail("扫描快照保存失败");
+      if (canonicalize(await this.kv.get(`${PREFIX}snapshot.${1 - index}`, null)) !== this.slots[1 - index]) fail("保存时出现并发更新，请重新校验数据");
+      this.slots[index] = canonicalize(envelope);
+      this.head = await digest(envelope);
+      this.state = state;
+      this.events = new Map(state.events.map((event) => [event.time, event]));
+    }
+    async prepareShare(now = new Date().toISOString()) {
+      if (!this.state.baseline) fail("首次扫描尚未完成，暂不能分享");
+      await this.assertUnchanged();
+      await this.loadShares();
+      // Recover a package saved just before a crash, before returning it or creating its successor.
+      await this.saveShareHead();
+      const records = this.state.events.slice(0, this.state.baseline.count);
+      const byTime = new Map(records.map((event) => [event.time, canonicalize(event)]));
+      for (const [time, content] of this.shared) {
+        if (byTime.get(time) !== content) fail("完整基线缺少已分享事件或内容不一致；请完成重扫后核查，未修改分享历史");
+      }
+      const events = records.filter((event) => !this.shared.has(event.time)).sort((a, b) => a.time.localeCompare(b.time));
+      const lifetime = lifetimeOf(sumEvents(records));
+      if (this.lastBundle && !events.length && canonicalize(lifetime) === canonicalize(this.lastBundle.lifetime)) return this.lastBundle;
+      const content = { publicKey: this.identity.publicKey, sequence: (this.lastBundle?.sequence ?? 0) + 1,
+        previousBundleHash: this.lastBundle ? await digest(this.lastBundle) : null, packedAt: now, lifetime, events };
+      const bundle = { ...content, signature: await sign(this.identity.privateCryptoKey, content) };
+      const { hash } = await verifyBundle(bundle);
+      await this.assertUnchanged();
+      await this.kv.set(`${PREFIX}share.${hash}`, bundle);
+      await this.assertWriter();
+      if (canonicalize(await this.kv.get(`${PREFIX}share.${hash}`, null)) !== canonicalize(bundle)) fail("分享包保存失败，尚未下载");
+      await this.loadShares();
+      await this.saveShareHead();
+      return bundle;
+    }
   }
 
-  function formatDuration(milliseconds) {
-    const seconds = Math.max(0, Math.round(milliseconds / 1000));
-    if (seconds < 60) return `${seconds}秒`;
-    const minutes = Math.floor(seconds / 60);
-    return `${minutes}分${String(seconds % 60).padStart(2, "0")}秒`;
+  class PageMoved extends Error {}
+  function validatePage(page) {
+    if (!integer(page.number) || page.number < 1 || !integer(page.totalPages) || page.totalPages < page.number
+      || !Array.isArray(page.entries) || !validHash(page.digest)) fail("积分日志分页结构无效");
+    if (!page.entries.length && !page.empty) fail("积分表格尚未加载完成");
+    if (!page.entries.length && (page.number !== 1 || page.totalPages !== 1)) fail("空表与分页信息不一致");
+    let last = null;
+    for (const entry of page.entries) {
+      timestamp(entry.time);
+      if (last && (entry.time > last || entry.time.length !== last.length)) fail("积分日志顺序或时间精度异常");
+      last = entry.time;
+      if (entry.row !== null) validateRow(entry.row);
+    }
+    return page;
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  async function runScan(repo, adapter, progress = () => {}) {
+    let reads = 0;
+    let totalPages = 1;
+    let moved = 0;
+    const started = Date.now();
+    const initialDraws = repo.state.events.length;
+    async function read(number) {
+      let error;
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          await repo.assertWriter();
+          const page = validatePage(await adapter.read(number));
+          if (page.number !== number) fail("翻页后停留在错误页码");
+          if (repo.state.job && page.entries.some((entry) => entry.time.length !== repo.state.job.upper.length)) fail("扫描过程中日志时间精度发生变化");
+          totalPages = page.totalPages;
+          reads++;
+          progress({ reads, time: repo.state.job?.cursor, etaMs: Math.max(0, totalPages - number) * (Date.now() - started) / reads, totals: repo.totals() });
+          return page;
+        } catch (caught) {
+          error = caught;
+          if (attempt < MAX_RETRIES) await adapter.delay?.(PAGE_DELAY_MS * (attempt + 1));
+        }
+      }
+      throw error;
+    }
+    async function locate(target) {
+      // Page numbers are temporary search coordinates, never stored progress.
+      for (let retry = 0; retry <= MAX_RETRIES; retry++) {
+        let candidate = await read(1);
+        if (!candidate.entries.length) fail("断点对应的日志已不存在");
+        if (candidate.entries.at(-1).time > target) {
+          let lo = 2;
+          let hi = candidate.totalPages;
+          candidate = null;
+          while (lo <= hi) {
+            const mid = Math.floor((lo + hi) / 2);
+            const page = await read(mid);
+            if (page.entries.at(-1).time <= target) { candidate = page; hi = mid - 1; } else lo = mid + 1;
+          }
+        }
+        if (!candidate) fail("无法定位扫描时间，日志可能已被删除");
+        if (candidate.number > 1) {
+          const previous = await read(candidate.number - 1);
+          if (previous.entries.at(-1).time <= target) continue;
+          candidate = await read(candidate.number);
+        }
+        if (candidate.entries.at(-1).time > target) continue;
+        if (!candidate.entries.some((entry) => entry.time === target)) fail("未找到完整时间边界，不能确认扫描衔接");
+        return candidate;
+      }
+      fail("定位期间页面持续移动，请稍后继续");
+    }
+    async function finish(state, upper) {
+      state.baseline = { upper, count: state.events.length };
+      state.job = null;
+      await repo.commit(state);
+    }
+    let page;
+    if (!repo.state.job) {
+      page = await read(1);
+      const upper = page.entries[0]?.time ?? null;
+      if (repo.state.baseline?.upper && (!upper || upper < repo.state.baseline.upper || upper.length !== repo.state.baseline.upper.length)) fail("日志最新时间回退或精度改变，未沿旧统计继续累计");
+      if (upper === null) {
+        const confirmation = await read(1);
+        if (confirmation.entries.length) fail("空表状态发生变化，请重试");
+        await finish(clone(repo.state), null);
+        return { reads, added: 0 };
+      }
+      const state = clone(repo.state);
+      state.job = { upper, cursor: null };
+      await repo.commit(state);
+    }
+    let boundary = repo.state.job.cursor;
+    if (!page) page = await locate(boundary ?? repo.state.job.upper);
+    let pending = null;
+    while (true) {
+      const state = clone(repo.state);
+      const job = state.job;
+      const previousCursor = job.cursor;
+      let done = false;
+      try {
+        if (!page.entries.length) fail("扫描途中日志变为空表，请核查");
+        if (pending) {
+          if (page.entries[0].time > pending.time) throw new PageMoved("页面位置已移动");
+          const relevantTie = page.entries[0].time === pending.time && (pending.rows.length
+            || page.entries.some((entry) => entry.time === pending.time && entry.row));
+          if (relevantTie) {
+            const guard = await read(pending.guard.number);
+            if (guard.digest !== pending.guard.digest) throw new PageMoved("未完成时间组的页边界已移动");
+          }
+        }
+        function close() {
+          if (!pending) return;
+          const event = combineBlock(pending.time, pending.rows);
+          const known = repo.events.get(pending.time) ?? state.events.slice(repo.state.events.length).find((item) => item.time === pending.time);
+          if (boundary !== null) {
+            if (pending.time !== boundary) fail("未读取完整恢复边界");
+            if (canonicalize(event) !== canonicalize(known ?? null)) fail(`${pending.time}：恢复边界事件发生变化，不能继续累计`);
+            boundary = null;
+          } else {
+            if (known && canonicalize(event) !== canonicalize(known)) fail(`${pending.time}：已保存事件出现冲突`);
+            if (event && !known) state.events.push(event);
+          }
+          job.cursor = pending.time;
+          if (state.baseline?.upper === pending.time) done = true;
+          pending = null;
+        }
+        const startAt = boundary ?? job.upper;
+        for (const entry of page.entries) {
+          if (entry.time > startAt) continue;
+          if (pending && pending.time !== entry.time) close();
+          if (done) break;
+          if (state.baseline?.upper && entry.time < state.baseline.upper) fail("未找到上次完整扫描的边界，不能确认增量衔接");
+          if (boundary !== null && entry.time < boundary) fail("未找到恢复边界，不能跳过后继续");
+          if (!pending) pending = { time: entry.time, rows: [], guard: { number: page.number, digest: page.digest } };
+          if (entry.row) pending.rows.push(entry.row);
+        }
+        let atEnd = false;
+        if (!done && page.number >= totalPages) {
+          const confirmation = await read(page.number);
+          if (confirmation.digest !== page.digest) throw new PageMoved("末页内容发生变化");
+          atEnd = page.number === totalPages;
+          if (atEnd) close();
+        }
+        if (done || atEnd) {
+          if (state.baseline?.upper && !done) fail("日志结束前没有确认原有覆盖边界");
+          await finish(state, job.upper);
+          return { reads, added: repo.state.events.length - initialDraws };
+        }
+        if (job.cursor !== repo.state.job.cursor || state.events.length !== repo.state.events.length) await repo.commit(state);
+        if (repo.state.job.cursor !== previousCursor) moved = 0;
+        await adapter.delay?.(PAGE_DELAY_MS);
+        page = await read(page.number + 1);
+      } catch (error) {
+        if (!(error instanceof PageMoved) || ++moved > MAX_RETRIES) throw error;
+        pending = null;
+        boundary = repo.state.job.cursor;
+        page = await locate(boundary ?? repo.state.job.upper);
+      }
+    }
   }
 
-  async function createSignedBundle(identity, share, records, lifetime) {
-    const events = records.map(normalizeEventRecord);
-    const content = {
-      publicKey: identity.publicKeySpki,
-      sequence: share.lastSequence + 1,
-      previousBundleHash: share.lastBundleHash,
-      events,
-      lifetime: normalizeLifetime(lifetime, events),
-    };
-    const signature = await signContent(identity.privateKeyPkcs8, content);
-    const bundleHash = await sha256Base64Url(`${canonicalize(content)}.${signature}`);
-    return { ...content, signature, bundleHash };
+  const api = { PREFIX, canonicalize, timestamp, parseRow, validateRow, combineBlock, validateEvent,
+    emptyTotals, addEvent, lifetimeOf, sumEvents, digest, sign, verifyBundle, createIdentity, Repository, validatePage, runScan };
+  if (typeof module !== "undefined" && module.exports) { module.exports = api; return; }
+
+  // Browser integration; keep collection restricted to the rendered credit-log table.
+  const browserKv = {
+    get: async (key, fallback = null) => GM_getValue(key, fallback),
+    set: async (key, value) => GM_setValue(key, value),
+    keys: async () => GM_listValues(),
+  };
+  let browserUi;
+  let browserRepo = null;
+  let browserBusy = false;
+
+  function creditTab() {
+    return [...document.querySelectorAll('button[role="tab"]')].find((tab) => textOf(tab) === "积分日志");
   }
+  function findCreditTable() {
+    for (const table of document.querySelectorAll("table")) {
+      const rows = [...table.querySelectorAll("tr")];
+      const header = rows.findIndex((row) => canonicalize([...row.querySelectorAll("th, td")].map(textOf))
+        === canonicalize(["类型", "变动", "说明", "时间"]));
+      if (header >= 0) return { table, rows: rows.slice(header + 1) };
+    }
+    return null;
+  }
+  function creditPagination(found = findCreditTable()) {
+    const root = found?.table.closest("section.tab-panel")?.querySelector(".log-pagination .pagination");
+    if (!root) return { number: 1, totalPages: 1, buttons: [], input: null, jump: null };
+    const buttons = [...root.querySelectorAll(".pagination-main button")]
+      .map((button) => ({ button, number: Number(textOf(button)) })).filter(({ number }) => integer(number) && number >= 1);
+    const active = buttons.filter(({ button }) => button.classList.contains("kd-btn--primary")
+      || button.getAttribute("aria-current") === "page");
+    if (active.length !== 1 || !buttons.length) fail("积分日志分页结构无法识别");
+    return { number: active[0].number, totalPages: Math.max(...buttons.map(({ number }) => number)), buttons,
+      input: root.querySelector("input.jump-input"), jump: root.querySelector(".pagination-jumper button") };
+  }
+  function visibleElement(node) {
+    if (!node || node.hidden) return false;
+    const style = getComputedStyle(node);
+    return style.display !== "none" && style.visibility !== "hidden";
+  }
+  function creditLoading(found = findCreditTable()) {
+    const wrapper = found?.table.closest(".loading-overlay-wrapper");
+    return wrapper?.getAttribute("aria-busy") === "true" || !!wrapper
+      && [...wrapper.querySelectorAll('.loading-overlay, [aria-busy="true"]')].some(visibleElement);
+  }
+  function readRenderedPage() {
+    if (location.pathname.replace(/\/$/, "") !== CREDIT_PATH || creditTab()?.getAttribute("aria-selected") !== "true") {
+      fail("积分日志已关闭；请登录后重新点击扫描");
+    }
+    const found = findCreditTable();
+    if (!found || creditLoading(found)) return null;
+    const { number, totalPages } = creditPagination(found);
+    const entries = [];
+    let explicitEmpty = false;
+    for (const row of found.rows) {
+      const cells = [...row.querySelectorAll("td")];
+      if (cells.length === 1 && Number(cells[0].getAttribute("colspan")) >= 4
+        && /^(?:暂无(?:积分)?(?:日志|记录|数据)|没有(?:积分)?(?:日志|记录|数据)|No\s+(?:data|records))(?:[。.!！])?$/i.test(textOf(cells[0]))) {
+        explicitEmpty = true;
+        continue;
+      }
+      if (cells.length !== 4) return null;
+      entries.push({ time: timestamp(textOf(cells[3])), row: parseRow(textOf(cells[0]), textOf(cells[1]), textOf(cells[2])) });
+    }
+    if (entries.length > 20 || (number < totalPages && entries.length !== 20)) return null;
+    if (!entries.length && !explicitEmpty) return null;
+    if (explicitEmpty && (entries.length || totalPages !== 1)) fail("空日志提示与分页内容冲突");
+    // Neither the digest nor the entries contain other logs' descriptions, types, or amounts.
+    return { number, totalPages, entries, empty: explicitEmpty };
+  }
+
+  // Observe before clicking: changing the active page alone does not prove new rows arrived.
+  // A loading cycle also accepts two pages whose actual contents are exactly equal.
+  function waitCreditPage(number, trigger = null) {
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      let busySeen = false;
+      let contentChanged = !trigger;
+      let stable = null;
+      let stableSince = 0;
+      const initial = findCreditTable();
+      const initialTable = initial?.table;
+      const initialBody = initialTable?.querySelector("tbody");
+      const finish = (error, page) => {
+        if (finished) return;
+        finished = true;
+        observer.disconnect();
+        clearInterval(poll);
+        clearTimeout(timeout);
+        if (error) reject(error); else resolve(page);
+      };
+      const check = (mutations = []) => {
+        if (finished) return;
+        try {
+          const found = findCreditTable();
+          if (creditLoading(found)) busySeen = true;
+          for (const mutation of mutations) {
+            if (mutation.type !== "attributes" && (initialBody?.contains(mutation.target)
+              || found?.table.querySelector("tbody")?.contains(mutation.target))) contentChanged = true;
+          }
+          if (found?.table && (found.table !== initialTable || found.table.querySelector("tbody") !== initialBody)) contentChanged = true;
+          if (busySeen && !creditLoading(found)) contentChanged = true;
+          const page = readRenderedPage();
+          if (!page || page.number !== number || !contentChanged) { stable = null; return; }
+          const key = canonicalize(page);
+          if (key !== stable) { stable = key; stableSince = Date.now(); return; }
+          if (Date.now() - stableSince >= 120) finish(null, page);
+        } catch (error) { finish(error); }
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true,
+        attributeFilter: ["class", "style", "hidden", "aria-busy", "aria-selected", "disabled"] });
+      const poll = setInterval(check, 50);
+      const timeout = setTimeout(() => finish(new Error("积分日志翻页未确认加载完成，已暂停；请稍后重试")), TIMEOUT_MS);
+      try { trigger?.(); check(); } catch (error) { finish(error); }
+    });
+  }
+
+  const browserAdapter = {
+    delay: sleep,
+    async read(number) {
+      const current = creditPagination();
+      if (!integer(number) || number < 1 || number > current.totalPages) fail(`无法访问积分日志第 ${number} 页`);
+      let page;
+      if (number === current.number) page = await waitCreditPage(number);
+      else {
+        let button = current.buttons.find((item) => item.number === number)?.button;
+        if (!button || button.disabled) {
+          if (!current.input || !current.jump) fail("积分日志缺少跳页控件");
+          const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(current.input), "value")?.set;
+          if (setter) setter.call(current.input, String(number)); else current.input.value = String(number);
+          current.input.dispatchEvent(new Event("input", { bubbles: true }));
+          current.input.dispatchEvent(new Event("change", { bubbles: true }));
+          const until = Date.now() + Math.min(3000, TIMEOUT_MS);
+          while (Date.now() < until && creditPagination().jump?.disabled) await sleep(50);
+          button = creditPagination().jump;
+          if (!button || button.disabled) fail("积分日志跳页按钮未启用");
+        }
+        page = await waitCreditPage(number, () => button.click());
+      }
+      return { ...page, digest: await digest(page.entries) };
+    },
+  };
 
   async function openCreditLog() {
     if (location.pathname.replace(/\/$/, "") !== CREDIT_PATH) {
-      // Carry this click across the navigation without storing a scan request.
       location.assign(`${location.origin}${CREDIT_PATH}${AUTO_SCAN_HASH}`);
       return false;
     }
-    setStatus("正在打开积分日志……");
-    await new Promise((resolve, reject) => {
-      let clickedTab = null;
-      let settled = false;
-      const finish = (error) => {
-        if (settled) return;
-        settled = true;
-        observer.disconnect();
-        clearTimeout(timer);
-        if (error) reject(error);
-        else resolve();
+    let clicked = null;
+    const until = Date.now() + TIMEOUT_MS;
+    while (Date.now() < until) {
+      if (location.pathname.replace(/\/$/, "") !== CREDIT_PATH) fail("页面已离开积分页；请登录后重新扫描");
+      const tab = creditTab();
+      if (tab?.getAttribute("aria-selected") === "true" && findCreditTable()) return true;
+      if (tab && !tab.disabled && tab !== clicked && tab.getAttribute("aria-selected") !== "true") {
+        clicked = tab;
+        tab.click();
+      }
+      await sleep(100);
+    }
+    fail("积分日志未能打开；请确认已登录后重试");
+  }
+
+  async function withBrowserWriter(task) {
+    const run = async () => {
+      const key = `${PREFIX}writer`;
+      const owner = crypto.randomUUID();
+      const leaseMs = 60000;
+      const old = await browserKv.get(key);
+      if (old?.until > Date.now()) fail("另一窗口正在扫描或分享，请先停止其他窗口的操作");
+      const lease = () => ({ owner, until: Date.now() + leaseMs });
+      await browserKv.set(key, lease());
+      // GM storage has no cross-origin compare-and-swap. Lease checks catch observed races;
+      // repository revision checks provide an additional guard, not absolute exclusion.
+      await sleep(75);
+      let lost = false;
+      let renewal = Promise.resolve();
+      const assertWriter = async () => {
+        const current = await browserKv.get(key);
+        if (lost || current?.owner !== owner || current.until <= Date.now()) fail("采集锁已失效或存在并发操作；已停止写入");
       };
-      const check = () => {
-        if (settled) return;
-        try {
-          if (location.pathname.replace(/\/$/, "") !== CREDIT_PATH) {
-            finish(new Error("页面已离开积分页；请登录论坛后重新点击扫描"));
-            return;
-          }
-          const tab = [...document.querySelectorAll('button[role="tab"]')]
-            .find((button) => textOf(button) === "积分日志");
-          if (tab?.getAttribute("aria-selected") === "true" && locateCreditTable(document)) {
-            finish();
-          } else if (tab && !tab.disabled && tab !== clickedTab
-            && tab.getAttribute("aria-selected") !== "true") {
-            clickedTab = tab;
-            tab.click();
-          }
-        } catch (error) {
-          finish(error);
-        }
-      };
-      const observer = new MutationObserver(check);
-      observer.observe(document.body, {
-        childList: true, subtree: true, characterData: true,
-        attributes: true, attributeFilter: ["aria-selected", "disabled"],
+      let timer;
+      try {
+        await assertWriter();
+        timer = setInterval(() => {
+          renewal = renewal.then(async () => {
+            await assertWriter();
+            await browserKv.set(key, lease());
+            await assertWriter();
+          }).catch(() => { lost = true; });
+        }, leaseMs / 3);
+        const writerKv = { ...browserKv, set: async (name, value) => {
+          await assertWriter();
+          await browserKv.set(name, value);
+          await assertWriter();
+        } };
+        return await task(assertWriter, writerKv);
+      } finally {
+        clearInterval(timer);
+        await renewal;
+        if ((await browserKv.get(key))?.owner === owner) await browserKv.set(key, null);
+      }
+    };
+    if (navigator.locks?.request) {
+      return navigator.locks.request(`${PREFIX}writer`, { ifAvailable: true }, (lock) => {
+        if (!lock) fail("另一窗口正在操作采集器");
+        return run();
       });
-      const timer = setTimeout(() => finish(new Error("积分日志未能在20秒内打开；请确认已登录后重试")), 20000);
-      check();
-    });
-    return true;
+    }
+    return run();
   }
-
-  function resumeRequestedScan() {
-    if (location.pathname.replace(/\/$/, "") !== CREDIT_PATH || location.hash !== AUTO_SCAN_HASH) return;
-    // Consume the one-off request before scanning; a later refresh must not restart it.
-    history.replaceState(history.state, "", `${location.pathname}${location.search}`);
-    void scanCreditLog();
+  function formatBrowserTotals(totals) {
+    return `总 cost：${totals.totalCost} KB\n总 KB 收入：${totals.totalResult[0]} KB\n总 BBT 收入：${totals.totalResult[1]} BBT\n总抽奖次数：${totals.totalDraw}`;
   }
-
-  async function scanCreditLog() {
-    if (busy) return;
-    setBusy(true);
-    setStatus("正在打开积分日志……");
-    let originalPage = 1;
-    let logOpened = false;
+  function showBrowserStatus(message, totals = null) {
+    if (browserUi) browserUi.status.textContent = message + (totals ? `\n${formatBrowserTotals(totals)}` : "");
+  }
+  function updateBrowserButtons() {
+    if (!browserUi) return;
+    browserUi.scan.disabled = browserBusy;
+    browserUi.share.disabled = browserBusy || !(browserRepo?.state.baseline || browserRepo?.lastBundle);
+    browserUi.share.title = browserRepo?.state.baseline ? "分享最近一次完整扫描的数据"
+      : browserRepo?.lastBundle ? "重新下载上一有效分享包；本地进度仍需补全" : "首次扫描完成后才可分享";
+  }
+  function formatBrowserEta(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "估算中";
+    const minutes = Math.ceil(ms / 60000);
+    return minutes < 1 ? "不足 1 分钟" : minutes < 60 ? `约 ${minutes} 分钟` : `约 ${Math.ceil(minutes / 60)} 小时`;
+  }
+  async function scanBrowserLogs() {
+    if (browserBusy) return;
+    browserBusy = true;
+    updateBrowserButtons();
     try {
+      showBrowserStatus("正在打开积分日志……");
       if (!await openCreditLog()) return;
-      logOpened = true;
-      setStatus("正在校验本地进度……");
-      const identity = await getIdentity();
-      const loaded = await loadScanState(identity);
-      const previous = loaded.state;
-      scanState = previous;
-      const initialPagination = paginationState();
-      if (initialPagination
-        && (!initialPagination.activePage
-          || !initialPagination.totalPages
-          || !initialPagination.pages.length)) {
-        throw new Error("积分日志分页器结构不完整");
-      }
-      originalPage = initialPagination?.activePage ?? 1;
-      let knownTotalPages = initialPagination?.totalPages ?? 1;
-      const mergedEntries = [];
-      const startedAt = Date.now();
-      let pagesRead = 0;
-      let scanUpperBound = null;
-      let cursorTime = null;
-      let coverageReached = false;
-
-      for (let targetPage = 1; targetPage <= knownTotalPages; targetPage++) {
-        await jumpToPage(targetPage);
-        if (!currentTableSignature()) throw new Error("当前页面没有找到 .log-table 积分表格");
-        const activePage = paginationState()?.activePage ?? 1;
-        if (activePage !== targetPage) throw new Error(`请求第 ${targetPage} 页后，页面停留在第 ${activePage} 页`);
-        const pageEntries = extractPage(document);
-        if (targetPage === 1 && !pageEntries.length) {
-          throw new Error("积分日志表格尚无可读记录；请等待页面加载完成后重试");
-        }
-        if (pageEntries.some((entry) => entry.time === null)) {
-          throw new Error("积分日志出现无法识别的时间；本次扫描未保存");
-        }
-        for (let index = 1; index < pageEntries.length; index++) {
-          if (pageEntries[index].time > pageEntries[index - 1].time) {
-            throw new Error("积分日志不是按时间倒序排列；本次扫描未保存");
-          }
-        }
-        if (targetPage === 1) {
-          const times = pageEntries.map((entry) => entry.time).filter(Boolean);
-          scanUpperBound = times.length ? times.reduce((latest, time) => time > latest ? time : latest) : null;
-        }
-        const boundedEntries = scanUpperBound
-          ? pageEntries.filter((entry) => entry.time <= scanUpperBound)
-          : pageEntries;
-        appendPageEntries(mergedEntries, boundedEntries);
-        pagesRead++;
-        const boundedTimes = pageEntries
-          .map((entry) => entry.time)
-          .filter((time) => time && (!scanUpperBound || time <= scanUpperBound));
-        if (boundedTimes.length) {
-          const oldestOnPage = boundedTimes.reduce((oldest, time) => time < oldest ? time : oldest);
-          cursorTime = cursorTime === null || oldestOnPage < cursorTime ? oldestOnPage : cursorTime;
-          if (previous.lifetimeDrawCount !== null && previous.modernNet !== null
-            && previous.coveredThrough && oldestOnPage < previous.coveredThrough) coverageReached = true;
-        }
-        const currentTotalPages = paginationState()?.totalPages ?? knownTotalPages;
-        knownTotalPages = currentTotalPages;
-        const averagePageMs = (Date.now() - startedAt) / pagesRead + PAGE_DELAY_MS;
-        const remainingPages = coverageReached ? 0 : Math.max(0, knownTotalPages - targetPage);
-        const eta = remainingPages ? `，预计最多还需 ${formatDuration(averagePageMs * remainingPages)}` : "";
-        const restoredNote = loaded.signatureInvalid ? "；旧进度签名无效，正在重建"
-          : previous.lifetimeDrawCount === null || previous.modernNet === null
-            ? "；正在补全次数与分币种净收入（仅此次）" : "";
-        setStatus(`已读取 ${pagesRead} 页，当前到 ${cursorTime ?? "未知时间"}${eta}${restoredNote}……`);
-        if (coverageReached || targetPage >= knownTotalPages) break;
-        await sleep(PAGE_DELAY_MS);
-      }
-
-      const update = await buildScanUpdate(previous, mergedEntries, scanUpperBound);
-      const saved = await saveScanState(identity, update.state);
-      const rebuilt = loaded.signatureInvalid ? "旧进度验签失败，已重新全量建立。\n" : "";
-      setStatus(`${rebuilt}${formatScanSummary(pagesRead, update.newEventCount, saved, update.ignoredMetricRows)}`);
-    } catch (error) {
-      console.error("[神社研究] 扫描失败", error);
-      setStatus(`扫描失败：${error.message}`);
-    } finally {
-      if (logOpened && (paginationState()?.activePage ?? 1) !== originalPage) {
-        try {
-          await jumpToPage(originalPage);
-        } catch (error) {
-          console.warn("[神社研究] 无法恢复原页", error);
-        }
-      }
-      setBusy(false);
-    }
-  }
-
-  async function shareIncrementalBundle() {
-    if (busy) return;
-    setBusy(true);
-    try {
-      const identity = await getIdentity();
-      // Reload and verify even when this tab previously scanned successfully.
-      const loaded = await loadScanState(identity);
-      scanState = loaded.state;
-      const lastBundle = scanState.share.lastBundle;
-      const lifetime = loaded.restored && scanState.coveredThrough !== null && scanState.lifetimeDrawCount !== null
-        ? normalizeLifetime({
-          through: scanState.coveredThrough,
-          drawCount: scanState.lifetimeDrawCount,
-          net: scanState.lifetimeNet,
-        }, scanState.pendingEvents) : null;
-      if (!lifetime && !lastBundle) throw new Error("请先完成扫描以补全生涯记录。");
-      if (!lifetime || (!scanState.pendingEvents.length
-        && canonicalize(lifetime) === canonicalize(lastBundle?.lifetime))) {
-        downloadJson(
-          lastBundle,
-          `shrine-${identity.contributorId.slice(-8)}-${scanState.share.lastSequence}.json`,
-        );
-        setStatus(lifetime ? "新版记录与生涯汇总未变化；已重新下载上一数据包。"
-          : "已重新下载上一数据包；请完成扫描后再分享新的生涯汇总。");
-        return;
-      }
-      if (lastBundle?.lifetime && (lifetime.through < lastBundle.lifetime.through
-        || lifetime.drawCount < lastBundle.lifetime.drawCount)) {
-        throw new Error("生涯时间或次数较已分享记录回退；请核对本地进度与日志，未生成新包。");
-      }
-
-      const bundle = await createSignedBundle(identity, scanState.share, scanState.pendingEvents, lifetime);
-      const fileName = `shrine-${identity.contributorId.slice(-8)}-${bundle.sequence}.json`;
-      await saveScanState(identity, {
-        ...scanState,
-        pendingEvents: [],
-        share: { lastSequence: bundle.sequence, lastBundleHash: bundle.bundleHash, lastBundle: bundle },
+      await withBrowserWriter(async (assertWriter, writerKv) => {
+        const identity = await createIdentity(writerKv);
+        browserRepo = new Repository(writerKv, identity, assertWriter);
+        await browserRepo.load(true);
+        const result = await runScan(browserRepo, browserAdapter, ({ reads, etaMs, totals }) => {
+          showBrowserStatus(`${browserRepo.notice ? `${browserRepo.notice}\n` : ""}已扫描部分：读取 ${reads} 页，预计剩余 ${formatBrowserEta(etaMs)}。`, totals);
+        });
+        showBrowserStatus(`完成：读取 ${result.reads} 页，本次新增 ${result.added} 次。`, browserRepo.baselineTotals());
       });
-      downloadJson(bundle, fileName);
-      setStatus(`已分享 ${bundle.events.length} 条新版新增记录及生涯汇总（共 ${lifetime.drawCount} 次抽奖）。匿名贡献者：${identity.contributorId}`);
     } catch (error) {
-      console.error("[神社研究] 分享失败", error);
-      setStatus(`分享失败：${error.message}`);
+      showBrowserStatus(`扫描暂停：${error.message}\n已成功保存的进度会在下次扫描时继续。`, browserRepo?.totals());
     } finally {
-      setBusy(false);
+      browserBusy = false;
+      updateBrowserButtons();
     }
   }
-
-  function downloadJson(value, fileName) {
-    const blob = new Blob([`${JSON.stringify(value, null, 2)}\n`], { type: "application/json;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
+  function downloadBrowserBundle(bundle, suffix) {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(bundle)], { type: "application/json;charset=utf-8" }));
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = fileName;
-    anchor.style.display = "none";
+    anchor.download = `shrine-${suffix}-${bundle.sequence}.json`;
+    anchor.hidden = true;
     document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    try { anchor.click(); } finally { anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 2000); }
   }
-
-  function setStatus(message) {
-    if (statusElement) statusElement.textContent = message;
+  async function shareBrowserLogs() {
+    if (browserBusy) return;
+    browserBusy = true;
+    updateBrowserButtons();
+    try {
+      await withBrowserWriter(async (assertWriter, writerKv) => {
+        if (!await browserKv.get(`${PREFIX}identity`)) fail("首次扫描尚未完成，暂不能分享");
+        const identity = await createIdentity(writerKv);
+        browserRepo = new Repository(writerKv, identity, assertWriter);
+        await browserRepo.load(false);
+        if (!browserRepo.state.baseline && browserRepo.lastBundle) {
+          const bundle = browserRepo.lastBundle;
+          downloadBrowserBundle(bundle, (await digest(bundle.publicKey)).slice(0, 8));
+          showBrowserStatus("本地进度需补全，已重新下载上一有效包。", bundle.lifetime);
+          return;
+        }
+        const bundle = await browserRepo.prepareShare();
+        downloadBrowserBundle(bundle, (await digest(bundle.publicKey)).slice(0, 8));
+        showBrowserStatus(`已生成分享包：${bundle.events.length} 次事件。${browserRepo.state.job ? "未完成扫描的数据未包含在内。" : ""}`, browserRepo.baselineTotals());
+      });
+    } catch (error) {
+      showBrowserStatus(`分享失败：${error.message}`);
+    } finally {
+      browserBusy = false;
+      updateBrowserButtons();
+    }
   }
-
-  function setBusy(value) {
-    busy = value;
-    for (const button of actionButtons) button.disabled = value;
-  }
-
-  function addPanel() {
-    if (panelHost) return;
+  async function mountBrowserPanel() {
     const host = document.createElement("div");
-    host.style.position = "fixed";
-    host.style.right = "16px";
-    host.style.bottom = "16px";
-    host.style.zIndex = "2147483647";
+    host.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647";
     document.documentElement.appendChild(host);
-    panelHost = host;
     const shadow = host.attachShadow({ mode: "closed" });
-    shadow.innerHTML = `
-      <style>
-        .panel { width: 310px; font: 13px/1.45 Arial, sans-serif; color: #1f2937; background: #fff; border: 1px solid #cbd5e1; border-radius: 8px; box-shadow: 0 8px 28px rgba(15,23,42,.18); padding: 12px; }
-        .panel.collapsed { width: auto; padding: 0; border: 0; background: transparent; box-shadow: none; }
-        .panel.collapsed h2 { display: none; }
-        .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-        h2 { font-size: 15px; margin: 0; }
-        p { margin: 6px 0; }
-        .buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 8px 0; }
-        button { border: 1px solid #94a3b8; border-radius: 5px; background: #f8fafc; color: #0f172a; padding: 7px 8px; cursor: pointer; }
-        button.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
-        button:disabled { cursor: wait; opacity: .6; }
-        .toggle { width: 28px; height: 28px; padding: 0; flex: none; font-size: 18px; }
-        .status { min-height: 38px; padding: 7px; background: #f1f5f9; border-radius: 5px; overflow-wrap: anywhere; white-space: pre-line; }
-        .note { color: #64748b; font-size: 12px; }
-      </style>
-      <section class="panel">
-        <div class="panel-header">
-          <h2>神社事件采集器</h2>
-          <button id="toggle" class="toggle" type="button" title="最小化" aria-label="最小化" aria-expanded="true" aria-controls="panel-content">−</button>
-        </div>
-        <div id="panel-content">
-          <p class="note">登录论坛后点击扫描，将自动打开积分日志。分享包含新版事件增量和生涯汇总。</p>
-          <div class="buttons">
-            <button id="scan" class="primary">扫描</button>
-            <button id="share">分享</button>
-          </div>
-          <p id="status" class="status" title="均值和标准差按1 BBT=20 KB折算；标准差按样本公式计算。净收入按KB、BBT分别求和，奉纳从KB扣除。生涯次数按日志的不同分钟统计，同次抽奖的多行合计一次。">尚未扫描。</p>
-        </div>
-      </section>`;
-    statusElement = shadow.getElementById("status");
-    actionButtons = [...shadow.querySelectorAll(".buttons button")];
-    const toggle = shadow.getElementById("toggle");
-    const content = shadow.getElementById("panel-content");
+    shadow.innerHTML = `<style>
+      .panel{width:310px;max-width:calc(100vw - 56px);padding:12px;background:#fff;color:#1f2937;border:1px solid #cbd5e1;border-radius:8px;box-shadow:0 8px 28px #0f172a2e;font:13px/1.5 Arial,sans-serif}
+      header{display:flex;align-items:center;justify-content:space-between;gap:12px}h2{font-size:15px;margin:0}p{margin:7px 0}.note{color:#64748b;font-size:12px}
+      button{border:1px solid #94a3b8;border-radius:5px;background:#f8fafc;color:#0f172a;padding:7px 8px;cursor:pointer}button:disabled{opacity:.6;cursor:default}
+      .actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}#scan{background:#1d4ed8;color:white;border-color:#1d4ed8}#toggle{width:28px;height:28px;padding:0;font-size:18px}
+      #status{padding:7px;background:#f1f5f9;border-radius:5px;white-space:pre-line;overflow-wrap:anywhere}.collapsed{width:auto;padding:0;border:0;background:transparent;box-shadow:none}.collapsed h2{display:none}
+    </style><section class="panel"><header><h2>神社事件采集器</h2><button id="toggle" type="button" aria-controls="content">−</button></header>
+      <div id="content"><p class="note">登录论坛后点击扫描，将自动打开积分日志。收入不扣奉纳，首次扫描完成后可分享。</p>
+      <div class="actions"><button id="scan" type="button" disabled>扫描</button><button id="share" type="button" disabled>分享</button></div>
+      <p id="status" role="status">正在读取本地进度……</p></div></section>`;
     const panel = shadow.querySelector(".panel");
-    const setCollapsed = (collapsed) => {
-      content.hidden = collapsed;
-      panel.classList.toggle("collapsed", collapsed);
-      toggle.textContent = collapsed ? "+" : "−";
-      toggle.title = collapsed ? "展开" : "最小化";
+    const content = shadow.getElementById("content");
+    const toggle = shadow.getElementById("toggle");
+    browserUi = { scan: shadow.getElementById("scan"), share: shadow.getElementById("share"), status: shadow.getElementById("status") };
+    const collapse = (value) => {
+      content.hidden = value;
+      panel.classList.toggle("collapsed", value);
+      toggle.textContent = value ? "+" : "−";
+      toggle.title = value ? "展开" : "最小化";
       toggle.setAttribute("aria-label", toggle.title);
-      toggle.setAttribute("aria-expanded", String(!collapsed));
+      toggle.setAttribute("aria-expanded", String(!value));
     };
-    setCollapsed(GM_getValue(STORE.panelCollapsed, false) === true);
+    collapse(await browserKv.get(`${PREFIX}collapsed`, false) === true);
     toggle.addEventListener("click", () => {
-      setCollapsed(!content.hidden);
-      GM_setValue(STORE.panelCollapsed, content.hidden);
+      collapse(!content.hidden);
+      void browserKv.set(`${PREFIX}collapsed`, content.hidden).catch(() => {});
     });
-    shadow.getElementById("scan").addEventListener("click", scanCreditLog);
-    shadow.getElementById("share").addEventListener("click", shareIncrementalBundle);
+    browserUi.scan.addEventListener("click", scanBrowserLogs);
+    browserUi.share.addEventListener("click", shareBrowserLogs);
   }
-
-  addPanel();
-  resumeRequestedScan();
+  async function startBrowser() {
+    browserBusy = true;
+    await mountBrowserPanel();
+    updateBrowserButtons();
+    try {
+      if (await browserKv.get(`${PREFIX}identity`)) {
+        browserRepo = new Repository(browserKv, await createIdentity(browserKv));
+        await browserRepo.load(false);
+        showBrowserStatus(browserRepo.notice || (browserRepo.state.job ? "已扫描部分：有未完成任务，点击扫描继续。"
+          : browserRepo.state.baseline ? "上次完整扫描的生涯成绩：" : "尚未扫描。"), browserRepo.totals());
+      } else showBrowserStatus("尚未扫描。首次完整扫描后可分享。");
+    } catch (error) { showBrowserStatus(`本地数据无法读取：${error.message}`); }
+    finally { browserBusy = false; updateBrowserButtons(); }
+    if (location.pathname.replace(/\/$/, "") === CREDIT_PATH && location.hash === AUTO_SCAN_HASH) {
+      history.replaceState(history.state, "", `${location.pathname}${location.search}`);
+      void scanBrowserLogs();
+    }
+  }
+  void startBrowser();
 })();
