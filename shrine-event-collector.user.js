@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         神社记录采集器
 // @namespace    shrine-event-study
-// @version      1.0.3
-// @description  只读扫描神社时运事件积分日志，生成匿名、增量、数字签名的数据包。
+// @version      1.1.0
+// @updateURL    https://raw.githubusercontent.com/ZEPHYR65537/shrine-event-collector/main/shrine-event-collector.user.js
+// @downloadURL  https://raw.githubusercontent.com/ZEPHYR65537/shrine-event-collector/main/shrine-event-collector.user.js
+// @description  只读扫描神社积分日志，分享已签名的新版事件增量与生涯汇总。
 // @match        https://bbs.acgn.at/*
 // @match        https://bbs2.kdays.net/*
 // @match        https://b.schale.moe/*
@@ -506,6 +508,7 @@
       || normalized.costKb > 6
       || !Number.isSafeInteger(normalized.resultVector.kb)
       || !Number.isSafeInteger(normalized.resultVector.bbt)
+      || typeof normalized.time !== "string"
       || parseLocalTimestamp(normalized.time) !== normalized.time) {
       throw new Error("扫描状态中存在无效事件");
     }
@@ -531,6 +534,34 @@
     return { lastSequence: 0, lastBundleHash: null, lastBundle: null };
   }
 
+  function normalizeLifetime(lifetime, events = []) {
+    if (!lifetime || typeof lifetime !== "object" || Array.isArray(lifetime)
+      || Object.keys(lifetime).some((key) => !["through", "drawCount", "net"].includes(key))
+      || typeof lifetime.through !== "string"
+      || parseLocalTimestamp(lifetime.through) !== lifetime.through
+      || !Number.isSafeInteger(lifetime.drawCount) || lifetime.drawCount < events.length
+      || !lifetime.net || typeof lifetime.net !== "object" || Array.isArray(lifetime.net)
+      || Object.keys(lifetime.net).some((key) => !["kb", "bbt"].includes(key))
+      || !Number.isSafeInteger(lifetime.net.kb) || !Number.isSafeInteger(lifetime.net.bbt)
+      || (lifetime.drawCount === 0 && (lifetime.net.kb !== 0 || lifetime.net.bbt !== 0))
+      || events.some((event) => event.time > lifetime.through)) {
+      throw new Error("生涯汇总无效或与新版记录不一致；请先完成扫描以补全生涯记录。");
+    }
+    return {
+      through: lifetime.through,
+      drawCount: lifetime.drawCount,
+      net: { kb: lifetime.net.kb, bbt: lifetime.net.bbt },
+    };
+  }
+
+  function signedBundleContent(bundle) {
+    const { publicKey, sequence, previousBundleHash, events } = bundle;
+    const content = { publicKey, sequence, previousBundleHash, events };
+    // Old six-field bundles must retain their original signed payload.
+    if (Object.prototype.hasOwnProperty.call(bundle, "lifetime")) content.lifetime = bundle.lifetime;
+    return content;
+  }
+
   function normalizeSavedBundle(bundle) {
     if (bundle === null) return null;
     if (!bundle || typeof bundle !== "object" || Array.isArray(bundle)) {
@@ -544,6 +575,9 @@
       signature: bundle.signature,
       bundleHash: bundle.bundleHash,
     };
+    if (Object.prototype.hasOwnProperty.call(bundle, "lifetime")) {
+      normalized.lifetime = normalizeLifetime(bundle.lifetime, normalized.events ?? []);
+    }
     if (typeof normalized.publicKey !== "string"
       || !Number.isSafeInteger(normalized.sequence)
       || normalized.sequence < 1
@@ -551,7 +585,7 @@
         || (typeof normalized.previousBundleHash === "string" && /^[A-Za-z0-9_-]{43}$/.test(normalized.previousBundleHash)))
       || (normalized.sequence === 1 && normalized.previousBundleHash !== null)
       || (normalized.sequence > 1 && normalized.previousBundleHash === null)
-      || !normalized.events?.length
+      || !normalized.events || (!normalized.events.length && !normalized.lifetime)
       || typeof normalized.signature !== "string"
       || !/^[A-Za-z0-9_-]+$/.test(normalized.signature)
       || typeof normalized.bundleHash !== "string"
@@ -663,12 +697,7 @@
     if (!share.lastBundle) return share.lastSequence === 0 && share.lastBundleHash === null;
     const bundle = share.lastBundle;
     if (bundle.publicKey !== identity.publicKeySpki) return false;
-    const content = {
-      publicKey: bundle.publicKey,
-      sequence: bundle.sequence,
-      previousBundleHash: bundle.previousBundleHash,
-      events: bundle.events,
-    };
+    const content = signedBundleContent(bundle);
     return await verifyContentSignature(bundle.publicKey, content, bundle.signature)
       && await sha256Base64Url(`${canonicalize(content)}.${bundle.signature}`) === bundle.bundleHash;
   }
@@ -910,14 +939,14 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  async function createSignedBundle(identity, share, records) {
+  async function createSignedBundle(identity, share, records, lifetime) {
     const events = records.map(normalizeEventRecord);
-    if (!events.length) throw new Error("没有待分享的新版记录。");
     const content = {
       publicKey: identity.publicKeySpki,
       sequence: share.lastSequence + 1,
       previousBundleHash: share.lastBundleHash,
       events,
+      lifetime: normalizeLifetime(lifetime, events),
     };
     const signature = await signContent(identity.privateKeyPkcs8, content);
     const bundleHash = await sha256Base64Url(`${canonicalize(content)}.${signature}`);
@@ -1082,22 +1111,33 @@
     setBusy(true);
     try {
       const identity = await getIdentity();
-      if (!scanState) {
-        const loaded = await loadScanState(identity);
-        if (!loaded.restored) throw new Error("请先扫描积分日志。");
-        scanState = loaded.state;
-      }
-      if (!scanState.pendingEvents.length) {
-        if (!scanState.share.lastBundle) throw new Error("没有待分享的新版记录。");
+      // Reload and verify even when this tab previously scanned successfully.
+      const loaded = await loadScanState(identity);
+      scanState = loaded.state;
+      const lastBundle = scanState.share.lastBundle;
+      const lifetime = loaded.restored && scanState.coveredThrough !== null && scanState.lifetimeDrawCount !== null
+        ? normalizeLifetime({
+          through: scanState.coveredThrough,
+          drawCount: scanState.lifetimeDrawCount,
+          net: scanState.lifetimeNet,
+        }, scanState.pendingEvents) : null;
+      if (!lifetime && !lastBundle) throw new Error("请先完成扫描以补全生涯记录。");
+      if (!lifetime || (!scanState.pendingEvents.length
+        && canonicalize(lifetime) === canonicalize(lastBundle?.lifetime))) {
         downloadJson(
-          scanState.share.lastBundle,
+          lastBundle,
           `shrine-${identity.contributorId.slice(-8)}-${scanState.share.lastSequence}.json`,
         );
-        setStatus("没有新增记录；已重新下载上一数据包。");
+        setStatus(lifetime ? "新版记录与生涯汇总未变化；已重新下载上一数据包。"
+          : "已重新下载上一数据包；请完成扫描后再分享新的生涯汇总。");
         return;
       }
+      if (lastBundle?.lifetime && (lifetime.through < lastBundle.lifetime.through
+        || lifetime.drawCount < lastBundle.lifetime.drawCount)) {
+        throw new Error("生涯时间或次数较已分享记录回退；请核对本地进度与日志，未生成新包。");
+      }
 
-      const bundle = await createSignedBundle(identity, scanState.share, scanState.pendingEvents);
+      const bundle = await createSignedBundle(identity, scanState.share, scanState.pendingEvents, lifetime);
       const fileName = `shrine-${identity.contributorId.slice(-8)}-${bundle.sequence}.json`;
       await saveScanState(identity, {
         ...scanState,
@@ -1105,7 +1145,7 @@
         share: { lastSequence: bundle.sequence, lastBundleHash: bundle.bundleHash, lastBundle: bundle },
       });
       downloadJson(bundle, fileName);
-      setStatus(`已分享 ${bundle.events.length} 条新增记录。匿名贡献者：${identity.contributorId}`);
+      setStatus(`已分享 ${bundle.events.length} 条新版新增记录及生涯汇总（共 ${lifetime.drawCount} 次抽奖）。匿名贡献者：${identity.contributorId}`);
     } catch (error) {
       console.error("[神社研究] 分享失败", error);
       setStatus(`分享失败：${error.message}`);
@@ -1168,7 +1208,7 @@
           <button id="toggle" class="toggle" type="button" title="最小化" aria-label="最小化" aria-expanded="true" aria-controls="panel-content">−</button>
         </div>
         <div id="panel-content">
-          <p class="note">登录论坛后点击扫描，将自动打开积分日志。</p>
+          <p class="note">登录论坛后点击扫描，将自动打开积分日志。分享包含新版事件增量和生涯汇总。</p>
           <div class="buttons">
             <button id="scan" class="primary">扫描</button>
             <button id="share">分享</button>
